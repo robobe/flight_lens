@@ -1,0 +1,104 @@
+# FlightLens
+
+Read-only desktop flight analysis for local Bullet MCAP recordings. One **Flight
+Overview** tab combines X–Z trajectory, altitude, bbox edge clearance, an event
+summary and the exact recorded camera frame for a selected event.
+
+## Run
+
+This independent project belongs to the shared Bullet uv workspace. From this
+folder, install all workspace packages without removing other projects' tools:
+
+```bash
+uv sync --locked --all-packages --all-extras --all-groups
+uv run --locked --all-packages --all-extras --all-groups flight-lens
+```
+
+Open a file directly:
+
+```bash
+uv run --locked --all-packages --all-extras --all-groups flight-lens \
+  ../bullet_render/recordings/<flight>.mcap
+```
+
+Workspace task **FlightLens: Open** starts the same desktop window. Click **Open
+MCAP…** to select a local recording. No browser, server, live flight connection,
+configuration edits or changes to the original recording are involved. PySide6
+Essentials provides the Qt desktop widgets, and PyQtGraph provides the plots.
+Linux/Ubuntu with a working desktop display is the verified environment.
+
+## Flight Overview
+
+| View | Recorded information |
+| --- | --- |
+| X–Z trajectory | World X and world Z in metres, equal-distance aspect ratio, start triangle, end square and selected-time circle |
+| Altitude over simulation time | Actual world altitude, barometer altitude and explicit controller takeoff goal during takeoff/hover/search |
+| Bbox edge clearance | Left/top/right/bottom clearances in pixels; zero is boundary contact, negative values are beyond the boundary |
+| Summary | Outcome, recorded duration, peak altitude, first recorded fault, warning/error interval counts and recording integrity |
+| Events | Phase changes, visual rejection and navigation recovery intervals, physics state changes and renderer errors |
+| Event frame | One original image with its bbox, when an exact recorded identity and image are available |
+
+Drag the white cursor in either time plot; both plots share time and horizontal
+zoom. The position circle follows that simulation time on the trajectory, and
+the footer shows nearby recorded data ages/limits. Clicking an event selects its
+time, details and camera frame. The camera preview stays tied to the **selected
+event**, even when the time cursor subsequently moves. There is no video playback.
+Y displacement is reported separately because the X–Z view hides lateral motion.
+
+Repeated status packets become intervals rather than hundreds of event rows.
+Counts are recorded operational event intervals/transitions, not packet counts.
+Clipping is a warning/rejection, not proof of a failed flight or its cause.
+Flight outcome and recorder completeness are independent. A renderer error
+without a trustworthy simulation timestamp is listed as **unsynced**; selecting
+it does not invent a cursor time. Cursor readouts use a nearest sample within
+100 ms; data outside that window is unavailable. Curves break at gaps larger
+than five times the series' median positive sampling interval.
+
+## Source handling and compatibility
+
+- `analysis/physics/ground_truth` is preferred for each episode. If absent,
+  `render/drone_1/pose` is explicitly labelled **Rendered pose**, which may
+  contain noisy sensor-derived altitude or attitude. Peak altitude refers to
+  the displayed source, not inferred ground truth.
+- Barometer readings come from `analysis/physics/sensors`, with selected feedback
+  altitude as an older-file fallback. These are the sensor's exposed outputs,
+  including configured filtering; raw values are not reconstructed.
+- The optional mission diagnostic fields `takeoff_goal_altitude_m` and
+  `barometer_datum_m` expose the controller's sensor-based takeoff reference.
+  The goal is not reconstructed for older recordings and is not presented as
+  a descent reference during LOS tracking.
+- Edge clearances use stamped detector boxes and recorded dimensions, or
+  processed-box margin diagnostics when detector data is absent. The plot title
+  identifies which source is used.
+- Event images require `<image topic>/metadata`, keyed by original physics,
+  episode, stream, frame sequence and capture timestamp. The image itself is
+  located by recorded image log time and recorder sequence. Frame counter reuse
+  after renderer restart therefore cannot select the wrong exposure. Arrival
+  proximity alone never substitutes for an exact match.
+- The authoritative episode in `recording_health` is selected by default. With
+  older files the most recently first-seen episode is selected; the episode
+  dropdown allows inspection of other episodes in the same file.
+- Missing topics, invalid/unsupported packets, absent goals and recording skips
+  are visible notices. Indexed partial files show **Incomplete**. Unindexed or
+  corrupt files produce an error; recorded CRCs are checked. Recover/index a copy using MCAP tooling first.
+
+Scalar channels load on a cancellable worker. A file change supersedes older
+jobs, while cancellation/error retains a previously loaded flight. Images stay
+on disk until selected; the GUI caches at most three decoded frames. Files that
+change after loading must be reopened before loading an image.
+
+## Development and checks
+
+```bash
+uv run --locked --all-packages --all-extras --all-groups pytest -q
+```
+
+Qt tests use its offscreen platform. Real-display checks additionally exercise
+large recordings, rendering, event selection and exact image preview. See
+[the saved v1 plan](docs/plan-v1.md) for verification outcomes.
+
+The implementation separates `model.py` (immutable data), `reader.py` (MCAP and
+analysis), and `app.py` (workers and widgets). Additional topic-specific tabs can
+consume the same loaded dataset without adding recording/networking to widgets.
+Live data, additional tabs, comparison, playback and automated tuning/diagnosis
+are deferred.
