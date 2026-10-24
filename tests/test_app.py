@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from PySide6 import QtWidgets
 
-from flight_lens.app import Overview
+from flight_lens.app import ExportDialog, Overview
 from flight_lens.reader import load_flight, Cancelled
 
 
@@ -133,3 +133,73 @@ def test_image_error_is_explicit_and_time_zoom_is_shared(window,application,flig
     window.altitude.setXRange(0.,.2,padding=0)
     application.processEvents()
     assert window.margins.viewRange()[0]==pytest.approx(window.altitude.viewRange()[0])
+
+
+def test_export_dialog_and_background_export(window, application, flight_file, tmp_path, monkeypatch):
+    import flight_lens.app as module
+    dialog = ExportDialog(tmp_path/'movie.mp4', window)
+    assert not dialog.include_boxes.isChecked()
+    dialog.include_boxes.setChecked(True)
+    assert dialog.include_boxes.isChecked()
+    calls = []
+    def export(data, episode, destination, **kwargs):
+        calls.append((data, episode, destination, kwargs['include_boxes']))
+        kwargs['progress']('Exporting MP4: 50%')
+        return destination
+    monkeypatch.setattr(module, 'export_mp4', export)
+    assert not window.export_button.isEnabled()
+    window.apply_data(load_flight(flight_file))
+    until(application, lambda: not window.jobs)
+    assert window.export_button.isEnabled()
+    window.start_export(tmp_path/'movie.mp4', include_boxes=True)
+    until(application, lambda: not window.jobs)
+    assert calls[0][1] is window.episode and calls[0][3]
+    assert 'Exported MP4' in window.status.text()
+    assert window.export_button.isEnabled()
+    assert window.cancel_export_button.isHidden()
+
+
+@pytest.mark.parametrize('action', ['cancel', 'open', 'close'])
+def test_export_cancel_reopen_and_close(window, application, flight_file, tmp_path, monkeypatch, action):
+    import flight_lens.app as module
+    entered = Event()
+    def export(data, episode, destination, **kwargs):
+        entered.set()
+        while not kwargs['cancel']():
+            time.sleep(.002)
+        raise Cancelled()
+    monkeypatch.setattr(module, 'export_mp4', export)
+    window.apply_data(load_flight(flight_file))
+    until(application, lambda: not window.jobs)
+    window.start_export(tmp_path/'movie.mp4')
+    until(application, entered.is_set)
+    assert not window.export_button.isEnabled()
+    window.start_export(tmp_path/'second.mp4')
+    assert sum(job.kind == 'export' for job in window.jobs) == 1
+    if action == 'cancel':
+        window.cancel_export()
+    elif action == 'open':
+        window.open_file(flight_file)
+    else:
+        window.close()
+    until(application, lambda: not window.jobs)
+    if action == 'cancel':
+        assert 'export cancelled' in window.status.text()
+    elif action == 'open':
+        assert window.data.path == flight_file
+        assert 'Loaded' in window.status.text()
+    else:
+        assert not window.isVisible()
+
+
+def test_export_failure_is_visible(window, application, flight_file, tmp_path, monkeypatch):
+    import flight_lens.app as module
+    def fail(*args, **kwargs):
+        raise ValueError('encoder unavailable')
+    monkeypatch.setattr(module, 'export_mp4', fail)
+    window.apply_data(load_flight(flight_file))
+    until(application, lambda: not window.jobs)
+    window.start_export(tmp_path/'movie.mp4')
+    until(application, lambda: not window.jobs)
+    assert 'Could not export MP4: encoder unavailable' in window.status.text()
+    assert window.export_button.isEnabled()

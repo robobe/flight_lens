@@ -57,6 +57,7 @@ class FrameRef:
     identity: tuple
     width: int
     height: int
+    simulation_time_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,8 @@ class Episode:
     notices: tuple[str, ...]
     context_times: tuple[float, ...]
     contexts: tuple[Mapping, ...]
+    frames: tuple[FrameRef, ...]
+    boxes: Mapping
 
     def context_at(self, time_s):
         index = bisect_left(self.context_times, time_s)
@@ -124,3 +127,4 @@ class FlightData:
     episodes: tuple[Episode, ...]
     default_episode: int
     notices: tuple[str, ...]
+    camera_image_count: int | None = None

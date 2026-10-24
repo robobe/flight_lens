@@ -234,7 +234,9 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
                       sum(e.severity == 'warning' for e in events), len(failures), integrity)
     return Episode(key, trajectory, origin, barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
-                   events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts))
+                   events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts),
+                   tuple(sorted(frames.values(), key=lambda ref: (ref.log_time_ns, ref.record_sequence))),
+                   freeze({identity: boxes[identity] for identity in frames if identity in boxes}))
 
 
 def load_flight(path, progress=lambda message: None, cancel=lambda: False):
@@ -248,6 +250,9 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
         summary = reader.get_summary()
         if summary is None or not summary.chunk_indexes:
             raise ValueError('Recording has no usable index. Recover/index a copy with MCAP tooling, then reopen it.')
+        camera_image_count = None if summary.statistics is None else sum(
+            summary.statistics.channel_message_counts.get(cid, 0)
+            for cid, channel in summary.channels.items() if channel.topic == 'camera/front/image')
         for metadata in reader.iter_metadata():
             check_cancel(cancel)
             if metadata.name == 'recording_health':
@@ -281,8 +286,8 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
                         if width * height * 3 > MAX_IMAGE_BYTES:
                             width = height = 0
                         frames[identity] = FrameRef(value['image_topic'], value['image_log_time_ns'], value['image_record_sequence'],
-                                                   identity, width, height)
-                elif channel.topic == BBOX and value['bbox'] is not None:
+                                                   identity, width, height, metadata['source']['simulation_time_s'])
+                elif channel.topic == BBOX and value['image_topic'] == 'camera/front/image' and value['bbox'] is not None:
                     identity = frame_identity(value.get('source'), value['sequence'])
                     if identity is not None:
                         boxes[identity] = tuple(value['bbox'][key] for key in ('x', 'y', 'width', 'height'))
@@ -319,31 +324,41 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
         default = keys.index((authoritative['physics_id'], authoritative['episode_id']))
     notices = tuple(f'{count:,} unsupported or invalid messages skipped on {topic}.' for topic, count in warnings.items())
     progress(f'Loaded {len(records):,} scalar messages; images remain on disk.')
-    return FlightData(path, stat.st_size, stat.st_mtime_ns, tuple(episodes), default, notices)
+    return FlightData(path, stat.st_size, stat.st_mtime_ns, tuple(episodes), default, notices, camera_image_count)
+
+
+def check_file(data):
+    stat = data.path.stat()
+    if (stat.st_size, stat.st_mtime_ns) != (data.size, data.modified_ns):
+        raise ValueError('Recording changed since loading. Reopen the recording.')
+
+
+def decode_frame(channel, message):
+    """Validate and unpack one recorded RGB/BGR image, including row padding."""
+    if channel.message_encoding != 'protobuf' or len(message.data) > MAX_IMAGE_BYTES:
+        raise ValueError('Unsupported or oversized recorded image.')
+    image = RawImage.FromString(message.data)
+    if (image.width <= 0 or image.height <= 0 or image.step < image.width * 3
+            or image.step * image.height > MAX_IMAGE_BYTES or len(image.data) != image.step * image.height
+            or image.encoding not in ('rgb8', 'bgr8')):
+        raise ValueError('Unsupported recorded image layout.')
+    rows = np.frombuffer(image.data, dtype=np.uint8).reshape(image.height, image.step)
+    pixels = rows[:, :image.width * 3].reshape(image.height, image.width, 3)
+    if image.encoding == 'bgr8':
+        pixels = pixels[:, :, ::-1]
+    return Frame(image.width, image.height, pixels.tobytes())
 
 
 def read_frame(data, reference, cancel=lambda: False):
     check_cancel(cancel)
-    stat = data.path.stat()
-    if (stat.st_size, stat.st_mtime_ns) != (data.size, data.modified_ns):
-        raise ValueError('Recording changed since loading. Reopen the recording.')
+    check_file(data)
     with data.path.open('rb') as file:
         reader = make_reader(file, validate_crcs=True)
         for _, channel, message in reader.iter_messages(topics=[reference.topic], starting_at=reference.log_time_ns, ending_at=reference.log_time_ns):
             check_cancel(cancel)
             if message.sequence != reference.record_sequence:
                 continue
-            if channel.message_encoding != 'protobuf' or len(message.data) > MAX_IMAGE_BYTES:
-                raise ValueError('Unsupported or oversized recorded image.')
-            image = RawImage.FromString(message.data)
-            if (image.width <= 0 or image.height <= 0 or image.step < image.width * 3
-                    or image.step * image.height > MAX_IMAGE_BYTES or len(image.data) != image.step * image.height
-                    or image.encoding not in ('rgb8', 'bgr8')):
-                raise ValueError('Unsupported recorded image layout.')
-            rows = np.frombuffer(image.data, dtype=np.uint8).reshape(image.height, image.step)
-            pixels = rows[:, :image.width * 3].reshape(image.height, image.width, 3)
-            if image.encoding == 'bgr8':
-                pixels = pixels[:, :, ::-1]
+            frame = decode_frame(channel, message)
             check_cancel(cancel)
-            return Frame(image.width, image.height, pixels.tobytes())
+            return frame
     raise ValueError('Exact image record is missing from this recording.')

@@ -42,7 +42,7 @@ Drag the white cursor in either time plot; both plots share time and horizontal
 zoom. The position circle follows that simulation time on the trajectory, and
 the footer shows nearby recorded data ages/limits. Clicking an event selects its
 time, details and camera frame. The camera preview stays tied to the **selected
-event**, even when the time cursor subsequently moves. There is no video playback.
+event**, even when the time cursor subsequently moves. There is no in-app video playback.
 Y displacement is reported separately because the X–Z view hides lateral motion.
 
 Repeated status packets become intervals rather than hundreds of event rows.
@@ -87,6 +87,34 @@ jobs, while cancellation/error retains a previously loaded flight. Images stay
 on disk until selected; the GUI caches at most three decoded frames. Files that
 change after loading must be reopened before loading an image.
 
+## Export MP4
+
+Open an MCAP, select its episode, and click **Export MP4…**. Choose a destination
+and optionally check **Include bounding boxes** (off by default). Only exact-frame
+detector boxes are drawn; missing detections remain unannotated. No text or flight
+telemetry is added. The default filename is `<recording>-episode-<number>.mp4`.
+
+The selected episode's front-camera images are encoded as H.264, `yuv420p`, at
+30 FPS with fast-start enabled. Playback follows recorded **simulation time**,
+starting at the first image: recording-time pauses do not extend the movie. Each
+video tick uses the latest available exposure, repeating or dropping frames as
+necessary. The movie ends at the last simulation-time tick covered by the images,
+with one frame of display duration. Odd image dimensions are padded with black
+along the bottom/right edges, without scaling or changing image proportions.
+
+FFmpeg with the `libx264` encoder must be installed on PATH. The app checks it
+before conversion and reports missing support; it does not install system tools.
+Missing/decreasing simulation timestamps, missing image records, invalid layouts,
+changing image resolution and changed input files cause an explicit error.
+
+Export runs in the background with progress and **Cancel export**. Opening another
+recording or closing FlightLens also cancels it. Images are streamed rather than
+loaded together into memory. Output is encoded to a temporary sibling file and
+published only on success. Replacing an existing output requires confirmation;
+failures and cancellation preserve existing files. The original MCAP is never
+modified. Export currently supports one selected episode and front camera at a
+time; audio and other overlays are not included.
+
 ## Development and checks
 
 ```bash
@@ -100,5 +128,5 @@ large recordings, rendering, event selection and exact image preview. See
 The implementation separates `model.py` (immutable data), `reader.py` (MCAP and
 analysis), and `app.py` (workers and widgets). Additional topic-specific tabs can
 consume the same loaded dataset without adding recording/networking to widgets.
-Live data, additional tabs, comparison, playback and automated tuning/diagnosis
+Live data, additional tabs, comparison, in-app playback and automated tuning/diagnosis
 are deferred.

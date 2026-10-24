@@ -4,3 +4,4 @@ __pycache__/
 *.egg-info/
 *.mcap
 *.partial
+*.mp4

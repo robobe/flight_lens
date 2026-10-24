@@ -4,6 +4,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import datetime, timezone
 import json
+from pathlib import Path
 from threading import Event as CancelEvent
 
 import numpy as np
@@ -11,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from .reader import Cancelled, load_flight, read_frame
+from .video import export_mp4
 
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
@@ -82,12 +84,43 @@ class FrameCanvas(QtWidgets.QLabel):
         self._fit()
 
 
+class ExportDialog(QtWidgets.QDialog):
+    def __init__(self, destination, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Export MP4')
+        self.resize(580, 180)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(QtWidgets.QLabel('Selected episode · simulation-time playback · H.264 · 30 FPS'))
+        row = QtWidgets.QHBoxLayout()
+        self.destination = QtWidgets.QLineEdit(str(destination))
+        self.destination.setAccessibleName('MP4 output file')
+        browse = QtWidgets.QPushButton('Browse…')
+        browse.clicked.connect(self.browse)
+        row.addWidget(self.destination, 1)
+        row.addWidget(browse)
+        layout.addLayout(row)
+        self.include_boxes = QtWidgets.QCheckBox('Include bounding boxes')
+        layout.addWidget(self.include_boxes)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Save |
+                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def browse(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save MP4', self.destination.text(), 'MP4 video (*.mp4)',
+            options=QtWidgets.QFileDialog.Option.DontConfirmOverwrite)
+        if path:
+            self.destination.setText(path)
+
+
 class Overview(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.data = self.episode = None
         self.jobs = set()
         self.serial = self.load_token = self.preview_token = 0
+        self.export_token = -1
         self.closing = False
         self.frame_cache = OrderedDict()
         self.last_error = ''
@@ -126,6 +159,14 @@ class Overview(QtWidgets.QMainWindow):
         self.open_button = QtWidgets.QPushButton('Open MCAP…')
         self.open_button.clicked.connect(self.choose_file)
         top.addWidget(self.open_button)
+        self.export_button = QtWidgets.QPushButton('Export MP4…')
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.choose_export)
+        top.addWidget(self.export_button)
+        self.cancel_export_button = QtWidgets.QPushButton('Cancel export')
+        self.cancel_export_button.clicked.connect(self.cancel_export)
+        self.cancel_export_button.hide()
+        top.addWidget(self.cancel_export_button)
         self.cancel_button = QtWidgets.QPushButton('Cancel loading')
         self.cancel_button.clicked.connect(self.cancel_load)
         self.cancel_button.hide()
@@ -233,13 +274,49 @@ class Overview(QtWidgets.QMainWindow):
         if path:
             self.open_file(path)
 
+    def choose_export(self):
+        if self.data is None or self.episode is None or any(job.kind == 'export' for job in self.jobs):
+            return
+        number = self.episodes.currentIndex() + 1
+        dialog = ExportDialog(self.data.path.with_name(f'{self.data.path.stem}-episode-{number}.mp4'), self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        destination = Path(dialog.destination.text()).expanduser()
+        overwrite = False
+        if destination.exists():
+            overwrite = QtWidgets.QMessageBox.question(self, 'Replace MP4?', f'Replace {destination}?',
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No) == QtWidgets.QMessageBox.StandardButton.Yes
+            if not overwrite:
+                return
+        self.start_export(destination, include_boxes=dialog.include_boxes.isChecked(), overwrite=overwrite)
+
+    def start_export(self, destination, *, include_boxes=False, overwrite=False):
+        if self.data is None or self.episode is None or any(job.kind == 'export' for job in self.jobs):
+            return
+        data, episode = self.data, self.episode
+        job = self._task('export', lambda progress, cancel: export_mp4(data, episode, destination,
+            include_boxes=include_boxes, overwrite=overwrite, progress=progress, cancel=cancel))
+        self.export_token = job.token
+        self.export_button.setEnabled(False)
+        self.cancel_export_button.show()
+        self.status.setText('Preparing MP4 export…')
+        job.start()
+
+    def cancel_export(self):
+        for job in self.jobs:
+            if job.kind == 'export':
+                job.cancelled.set()
+        self.status.setText('Cancelling MP4 export…')
+
     def _task(self, kind, operation):
         self.serial += 1
         job = Task(kind, self.serial, operation)
         self.jobs.add(job)
         job.result.connect(lambda result, job=job: self._result(job, result))
         job.failed.connect(lambda message, job=job: self._failed(job, message))
-        job.progress.connect(lambda message, job=job: self.status.setText(message) if job.token == self.load_token else None)
+        job.progress.connect(lambda message, job=job: self.status.setText(message)
+                             if job.token in (self.load_token, self.export_token) and not job.cancelled.is_set() else None)
         job.finished.connect(lambda job=job: self._finished(job))
         return job
 
@@ -247,6 +324,9 @@ class Overview(QtWidgets.QMainWindow):
         for job in self.jobs:
             job.cancelled.set()
         self.preview_token = -1
+        self.export_token = -1
+        self.export_button.setEnabled(False)
+        self.cancel_export_button.hide()
         self.last_error = ''
         self.content.setEnabled(False)
         self.episodes.setEnabled(False)
@@ -264,6 +344,7 @@ class Overview(QtWidgets.QMainWindow):
         self.cancel_button.hide()
         self.content.setEnabled(True)
         self.episodes.setEnabled(True)
+        self.export_button.setEnabled(self.data is not None and not any(job.kind == 'export' for job in self.jobs))
         self.status.setText('Loading cancelled. Previous flight retained.' if self.data else 'Loading cancelled.')
 
     def _result(self, job, result):
@@ -271,6 +352,8 @@ class Overview(QtWidgets.QMainWindow):
             return
         if job.kind == 'load' and job.token == self.load_token:
             self.apply_data(result)
+        elif job.kind == 'export' and job.token == self.export_token:
+            self.status.setText(f'Exported MP4: {result}')
         elif job.kind == 'frame' and job.token == self.preview_token:
             reference, frame, bbox = result
             self.frame_cache[reference] = frame
@@ -288,12 +371,21 @@ class Overview(QtWidgets.QMainWindow):
             self.cancel_button.hide()
             self.content.setEnabled(True)
             self.episodes.setEnabled(True)
+            self.export_button.setEnabled(self.data is not None and not any(j.kind == 'export' for j in self.jobs))
+        elif job.kind == 'export' and job.token == self.export_token:
+            self.last_error = message
+            self.status.setText('Could not export MP4: ' + message)
         elif job.kind == 'frame' and job.token == self.preview_token:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact record could not be loaded')
             self.canvas.clear_frame('Exact frame unavailable: ' + message)
 
     def _finished(self, job):
         self.jobs.discard(job)
+        if job.kind == 'export':
+            self.cancel_export_button.hide()
+            self.export_button.setEnabled(self.data is not None and not any(j.kind == 'load' for j in self.jobs))
+            if job.token == self.export_token and job.cancelled.is_set() and not self.closing:
+                self.status.setText('MP4 export cancelled. Existing files preserved.')
         job.deleteLater()
         if self.closing and not self.jobs:
             self.close()
@@ -304,6 +396,7 @@ class Overview(QtWidgets.QMainWindow):
         self.cancel_button.hide()
         self.content.setEnabled(True)
         self.episodes.setEnabled(True)
+        self.export_button.setEnabled(not any(job.kind == 'export' for job in self.jobs))
         self.file_label.setText(data.path.name + f'  ·  {data.size / 1024**2:.1f} MiB')
         self.file_label.setToolTip(str(data.path))
         self.setWindowTitle('FlightLens · ' + data.path.name)
@@ -454,7 +547,7 @@ class Overview(QtWidgets.QMainWindow):
             job.cancelled.set()
         if self.jobs:
             event.ignore()
-            self.status.setText('Waiting for the file reader to stop…')
+            self.status.setText('Waiting for background tasks to stop…')
         else:
             event.accept()
 
