@@ -1,6 +1,6 @@
 # FlightLens v1
 
-Status: Implemented, verification complete. Implementation commit: Pending.
+Status: Implemented, verification complete. Implementation commit: `197874a3dae29ce7ecac74e372dbc9801fe66706`.
 
 Create an independent desktop project in the shared uv workspace. PySide6
 Essentials and PyQtGraph provide one Flight Overview tab. Keep MCAP reading,
@@ -55,3 +55,7 @@ shared workspace. Only Linux/X11 was checked.
 Existing recordings correctly lack the newly added explicit goal; future mission
 status publications include the controller goal and sensor datum without changing
 control state. Additional tabs, live data and tuning remain deferred.
+
+Supporting commits:
+- App goal/datum telemetry: `08cbf83561c127a459039373ec1d2bee05809f06`.
+- Shared workspace and dependency lock: `963445ff2a001ffdecdf9ea6fc97cb045c67ca25`.
