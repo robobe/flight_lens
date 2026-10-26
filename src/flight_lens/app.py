@@ -177,6 +177,8 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.content, 'Flight Overview')
         self.controls = QtWidgets.QWidget()
         self.tabs.addTab(self.controls, 'Attitude & Thrust')
+        self.velocity_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.velocity_tab, 'Velocity')
         outer.addWidget(self.tabs)
         layout = QtWidgets.QVBoxLayout(self.content)
         cards = QtWidgets.QHBoxLayout()
@@ -281,6 +283,20 @@ class Overview(QtWidgets.QMainWindow):
             plot.addLegend(offset=(10, 5), labelTextSize='10pt')
             controls_layout.addWidget(plot)
         self.thrust_plot.setXLink(self.attitude_plot)
+        velocity_layout = QtWidgets.QVBoxLayout(self.velocity_tab)
+        velocity_layout.setContentsMargins(12, 12, 12, 12)
+        self.velocity_plots = []
+        for axis in ('X', 'Y', 'Z'):
+            plot = pg.PlotWidget(title=f'{axis} velocity · ground truth' + (' and barometer-derived' if axis == 'Z' else ''))
+            plot.setLabel('left', 'Velocity', units='m/s')
+            plot.setLabel('bottom', 'Simulation time', units='s')
+            plot.getAxis('left').setWidth(76)
+            plot.showGrid(x=True, y=True, alpha=.15)
+            plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+            velocity_layout.addWidget(plot)
+            self.velocity_plots.append(plot)
+        self.velocity_plots[1].setXLink(self.velocity_plots[0])
+        self.velocity_plots[2].setXLink(self.velocity_plots[0])
         self.cursors = []
         self.selected_position = None
 
@@ -450,7 +466,7 @@ class Overview(QtWidgets.QMainWindow):
             self.cards[title].setText(title + '\n' + value)
         y_range = '' if summary.y_range_m is None else f' · World Y range {summary.y_range_m[0]:+.2f}…{summary.y_range_m[1]:+.2f} m'
         self.notices.setText(episode.trajectory_origin + y_range + '\n' + ' '.join((*self.data.notices, *episode.notices)))
-        for plot in (self.trajectory, self.altitude, self.margins, self.attitude_plot, self.thrust_plot):
+        for plot in (self.trajectory, self.altitude, self.margins, self.attitude_plot, self.thrust_plot, *self.velocity_plots):
             plot.clear()
         tx, x = episode.trajectory.plot(0)
         _, z = episode.trajectory.plot(2)
@@ -471,6 +487,10 @@ class Overview(QtWidgets.QMainWindow):
             self._curve(self.attitude_plot, episode.attitude, column, name, COLORS[column])
             self._curve(self.attitude_plot, episode.feedback_attitude, column, 'Estimated ' + name, COLORS[column], dashed=True)
         self._curve(self.thrust_plot, episode.thrust, 0, 'Commanded thrust', COLORS[3])
+        for column, (plot, axis) in enumerate(zip(self.velocity_plots, ('X', 'Y', 'Z'))):
+            self._curve(plot, episode.velocity, column, 'Ground truth ' + axis, COLORS[column])
+            if axis == 'Z':
+                self._curve(plot, episode.barometer_velocity, 0, 'Barometer-derived Z', COLORS[3], dashed=True)
         if episode.tracking_time_s is not None:
             for plot in (self.attitude_plot, self.thrust_plot):
                 plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,
@@ -478,7 +498,7 @@ class Overview(QtWidgets.QMainWindow):
                                               label='Tracking starts',
                                               labelOpts={'color': '#ffb454', 'position': .9}))
         self.cursors = []
-        for plot in (self.altitude, self.margins, self.attitude_plot, self.thrust_plot):
+        for plot in (self.altitude, self.margins, self.attitude_plot, self.thrust_plot, *self.velocity_plots):
             line = pg.InfiniteLine(0, angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
             plot.addItem(line)
             line.sigPositionChanged.connect(lambda line=line: self.set_cursor(line.value()))
@@ -488,6 +508,8 @@ class Overview(QtWidgets.QMainWindow):
         self.margins.enableAutoRange(axis='y')
         self.attitude_plot.enableAutoRange()
         self.thrust_plot.enableAutoRange()
+        for plot in self.velocity_plots:
+            plot.enableAutoRange()
         self.events.setUpdatesEnabled(False)
         with QtCore.QSignalBlocker(self.events):
             self.events.clearSelection()

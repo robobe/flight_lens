@@ -49,6 +49,13 @@ delivered motor thrust. A vertical marker identifies the first recorded LOS trac
 sample (`TRACK` / `LOS_APPROACH`). Missing topics remain visible as unavailable data
 instead of preventing the recording from opening.
 
+## Velocity
+
+The Velocity tab shows ground-truth X, Y and Z velocity in metres per second.
+The Z panel also shows vertical velocity derived from the recorded barometer
+altitude, using the sample timestamps. Its line is distinct from ground truth;
+it is unavailable when fewer than two altitude samples are recorded.
+
 Drag the white cursor in either time plot; both plots share time and horizontal
 zoom. The position circle follows that simulation time on the trajectory, and
 the footer shows nearby recorded data ages/limits. Clicking an event selects its

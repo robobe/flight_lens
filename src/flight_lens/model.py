@@ -98,6 +98,8 @@ class Episode:
     key: tuple[str, str]
     trajectory: Series
     trajectory_origin: str
+    velocity: Series
+    barometer_velocity: Series
     attitude: Series
     feedback_attitude: Series
     thrust: Series

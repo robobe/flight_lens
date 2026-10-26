@@ -103,6 +103,18 @@ def pose_rows(records, topic):
             for kind, t, _, v in records if kind == topic and t is not None]
 
 
+def velocity_rows(records):
+    return [(t, v['ground_truth']['linear_velocity_m_s'])
+            for kind, t, _, v in records if kind == TRUTH and t is not None]
+
+
+def derivative(samples):
+    if len(samples.times) < 2:
+        return series([])
+    values = np.gradient(samples.values[:, 0], samples.times)
+    return series(zip(samples.times, ((value,) for value in values)))
+
+
 def attitude(quaternion):
     try:
         x, y, z, w = (float(value) for value in quaternion)
@@ -154,6 +166,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     truth = pose_rows(records, TRUTH)
     origin = 'Actual ground truth' if truth else 'Rendered pose (may use noisy sensor sources)'
     trajectory = series(truth or pose_rows(records, POSE), 3)
+    velocity_rows_actual = velocity_rows(records)
     attitude_rows_actual = unwrap_attitude(attitude_rows(records, TRUTH) or attitude_rows(records, POSE))
     estimated_rows = unwrap_attitude(attitude_rows(records, FEEDBACK))
     barometer, feedback_altitude, goals, margins, processed_margins, thrust_rows = [], [], [], [], [], []
@@ -259,6 +272,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     events = tuple(sorted(events, key=lambda e: e.arrival_ns))
     failures = [e for e in events if e.severity == 'error']
     barometer_samples = series(barometer or feedback_altitude)
+    barometer_velocity_samples = derivative(barometer_samples)
+    velocity_samples = series(velocity_rows_actual, 3)
     goal_samples = series(goals)
     margin_samples = series(margins or processed_margins, 4)
     attitude_samples = series(attitude_rows_actual, 3)
@@ -284,6 +299,10 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
         notices.append('Controller attitude unavailable: no flight feedback orientation samples.')
     if not len(thrust_samples.times):
         notices.append('Commanded thrust unavailable: no timestamp-aligned RC samples.')
+    if not len(velocity_samples.times):
+        notices.append('Ground-truth velocity unavailable: no physics velocity samples.')
+    if not len(barometer_velocity_samples.times):
+        notices.append('Barometer-derived vertical velocity unavailable: fewer than two altitude samples.')
     integrity = 'Unknown'
     if health:
         integrity = 'Complete (recorder)' if health.get('complete') and not partial else 'Incomplete'
@@ -302,7 +321,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
                       (float(np.min(trajectory.values[:, 1])), float(np.max(trajectory.values[:, 1]))) if len(trajectory.times) else None,
                       failures[0].reason if failures else None,
                       sum(e.severity == 'warning' for e in events), len(failures), integrity)
-    return Episode(key, trajectory, origin, attitude_samples, feedback_attitude_samples, thrust_samples, tracking_time,
+    return Episode(key, trajectory, origin, velocity_samples, barometer_velocity_samples,
+                   attitude_samples, feedback_attitude_samples, thrust_samples, tracking_time,
                    barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
                    events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts),

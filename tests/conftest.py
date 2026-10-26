@@ -27,11 +27,11 @@ def mission(t, phase='LOS_APPROACH', reason='tracking', diagnostics=None, episod
                 hover_remaining_s=0., target_remaining_s=0., navigator_state='TRACK', diagnostics=diagnostics or {})
 
 
-def truth(t, position=(0., 0., 2.), episode='episode', orientation=(0., 0., 0., 1.)):
+def truth(t, position=(0., 0., 2.), episode='episode', orientation=(0., 0., 0., 1.), velocity=(0., 0., 0.)):
     s = source(t, round(t * 100), episode)
     return dict(schema_version=1, source=s, publisher_drops=0, ground_truth=dict(
         drone_id='drone_1', episode_id=episode, step_index=s['step_index'], simulation_time_s=t,
-        position_m=position, orientation_xyzw=list(orientation), linear_velocity_m_s=[0.]*3,
+        position_m=position, orientation_xyzw=list(orientation), linear_velocity_m_s=list(velocity),
         angular_velocity_rad_s=[0.]*3, rotor_speeds_rad_s=[0.]*4))
 
 
