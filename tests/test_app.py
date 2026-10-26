@@ -38,7 +38,7 @@ def window(application):
 def test_overview_async_loading_cursor_event_and_frame(window,application,flight_file):
     window.open_file(flight_file)
     until(application,lambda:window.data is not None and not window.jobs)
-    assert window.tabs.count()==1
+    assert window.tabs.count()==2
     assert window.events.rowCount()==len(window.episode.events)
     assert 'Mission fault' in window.cards['Outcome'].text()
     assert window.canvas.source_image is not None
@@ -64,6 +64,8 @@ def test_overview_async_loading_cursor_event_and_frame(window,application,flight
     goal_curve=next(curve for curve in window.altitude.listDataItems() if curve.name()=='Takeoff goal · barometer datum')
     assert goal_curve.opts['symbol']=='o'
     assert len(window.margins.plotItem.legend.items)==4
+    assert len(window.attitude_plot.plotItem.legend.items)==6
+    assert len(window.thrust_plot.plotItem.legend.items)==1
 
 
 def test_invalid_file_keeps_existing_flight(window,application,flight_file,tmp_path):

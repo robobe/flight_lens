@@ -27,12 +27,26 @@ def mission(t, phase='LOS_APPROACH', reason='tracking', diagnostics=None, episod
                 hover_remaining_s=0., target_remaining_s=0., navigator_state='TRACK', diagnostics=diagnostics or {})
 
 
-def truth(t, position=(0., 0., 2.), episode='episode'):
+def truth(t, position=(0., 0., 2.), episode='episode', orientation=(0., 0., 0., 1.)):
     s = source(t, round(t * 100), episode)
     return dict(schema_version=1, source=s, publisher_drops=0, ground_truth=dict(
         drone_id='drone_1', episode_id=episode, step_index=s['step_index'], simulation_time_s=t,
-        position_m=position, orientation_xyzw=[0., 0., 0., 1.], linear_velocity_m_s=[0.]*3,
+        position_m=position, orientation_xyzw=list(orientation), linear_velocity_m_s=[0.]*3,
         angular_velocity_rad_s=[0.]*3, rotor_speeds_rad_s=[0.]*4))
+
+
+def feedback(t, orientation=(0., 0., 0., 1.), episode='episode'):
+    s = source(t, round(t * 100), episode)
+    return dict(schema_version=1, source=s, barometer_altitude_m=2., orientation_xyzw=list(orientation),
+                armed=True, mode='angle', last_applied_sequence=s['step_index'], owner_id='app',
+                state='running', reason='tracking')
+
+
+def rc(t, throttle=1500, episode='episode'):
+    sequence = round(t * 100)
+    return dict(schema_version=1, physics_id='physics', episode_id=episode, app_id='app', sequence=sequence,
+                issued_us=10_000_000 + round(t * 1e6), valid_until_us=10_100_000 + round(t * 1e6),
+                active=True, channels=[1500, 1500, throttle, 1500, 2000, 2000] + [1000] * 12)
 
 
 def pose(t, position=(50., 0., 30.), episode='episode'):
@@ -81,7 +95,7 @@ def write_mcap(path, records, health_data=None, frames=()):
 
 @pytest.fixture
 def flight_file(tmp_path):
-    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS
+    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS,FEEDBACK,RC
     s=source(.1,10)
     diagnostics=dict(vision_reason='clipped_target',processed_image_stream_id='stream',
                      processed_image_sequence=42,processed_image_timestamp_s=s['measurement_us']/1e6,
@@ -92,9 +106,11 @@ def flight_file(tmp_path):
              (MISSION,.02,mission(0.,'TAKEOFF','climbing',dict(takeoff_goal_altitude_m=3.,barometer_datum_m=1.))),
              (METADATA,.1,frame_metadata(.1,42,.1)),
              (BBOX,.11,dict(schema_version=2,image_topic='camera/front/image',session='a'*32,sequence=42,capture_ns=s['measurement_us']*1000,source=s,bbox=dict(x=0,y=1,width=2,height=2))),
-             (TRUTH,.12,truth(.1,(1.,2.,2.))), (SENSORS,.13,sensors),
-             (MISSION,.14,mission(.1,diagnostics=diagnostics)),
-             (MISSION,.2,mission(.2,diagnostics=diagnostics)),
+             (TRUTH,.12,truth(.1,(1.,2.,2.),orientation=(.0871557,0.,0.,.9961947))),
+             (FEEDBACK,.13,feedback(.1,orientation=(0.,.1736482,0.,.9848078))),
+             (RC,.14,rc(.2,throttle=1500)), (SENSORS,.15,sensors),
+             (MISSION,.14,mission(.1,'YAW_SETTLE','settling',diagnostics)),
+             (MISSION,.2,mission(.2,'YAW_SETTLE','settling',diagnostics)),
              (MISSION,.3,mission(.3,diagnostics=dict(vision_reason='usable'))),
              (MISSION,.4,mission(.4,'FAULT','los_clipped_target',diagnostics)),
              (MISSION,.5,mission(.5,'FAULT','los_clipped_target',diagnostics))]

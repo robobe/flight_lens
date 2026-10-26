@@ -175,6 +175,8 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs = QtWidgets.QTabWidget()
         self.content = QtWidgets.QWidget()
         self.tabs.addTab(self.content, 'Flight Overview')
+        self.controls = QtWidgets.QWidget()
+        self.tabs.addTab(self.controls, 'Attitude & Thrust')
         outer.addWidget(self.tabs)
         layout = QtWidgets.QVBoxLayout(self.content)
         cards = QtWidgets.QHBoxLayout()
@@ -266,6 +268,19 @@ class Overview(QtWidgets.QMainWindow):
         self.status.setTextFormat(QtCore.Qt.TextFormat.PlainText)
         outer.addWidget(self.status)
         self.setCentralWidget(root)
+        controls_layout = QtWidgets.QVBoxLayout(self.controls)
+        controls_layout.setContentsMargins(12, 12, 12, 12)
+        self.attitude_plot = pg.PlotWidget(title='Attitude · actual and controller feedback')
+        self.attitude_plot.setLabel('left', 'Angle', units='deg')
+        self.thrust_plot = pg.PlotWidget(title='Commanded collective thrust')
+        self.thrust_plot.setLabel('left', 'Commanded thrust', units='%')
+        for plot in (self.attitude_plot, self.thrust_plot):
+            plot.getAxis('left').setWidth(76)
+            plot.setLabel('bottom', 'Simulation time', units='s')
+            plot.showGrid(x=True, y=True, alpha=.15)
+            plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+            controls_layout.addWidget(plot)
+        self.thrust_plot.setXLink(self.attitude_plot)
         self.cursors = []
         self.selected_position = None
 
@@ -435,7 +450,7 @@ class Overview(QtWidgets.QMainWindow):
             self.cards[title].setText(title + '\n' + value)
         y_range = '' if summary.y_range_m is None else f' · World Y range {summary.y_range_m[0]:+.2f}…{summary.y_range_m[1]:+.2f} m'
         self.notices.setText(episode.trajectory_origin + y_range + '\n' + ' '.join((*self.data.notices, *episode.notices)))
-        for plot in (self.trajectory, self.altitude, self.margins):
+        for plot in (self.trajectory, self.altitude, self.margins, self.attitude_plot, self.thrust_plot):
             plot.clear()
         tx, x = episode.trajectory.plot(0)
         _, z = episode.trajectory.plot(2)
@@ -452,8 +467,18 @@ class Overview(QtWidgets.QMainWindow):
             self._curve(self.margins, episode.margins, column, name, COLORS[column])
         self.margins.addItem(pg.InfiniteLine(0, angle=0, pen=pg.mkPen('#ff8282', style=QtCore.Qt.PenStyle.DashLine)))
         self.margins.setTitle(episode.margins_origin + ' edge clearance · zero is boundary contact')
+        for column, name in enumerate(('Roll', 'Pitch', 'Yaw')):
+            self._curve(self.attitude_plot, episode.attitude, column, name, COLORS[column])
+            self._curve(self.attitude_plot, episode.feedback_attitude, column, 'Estimated ' + name, COLORS[column], dashed=True)
+        self._curve(self.thrust_plot, episode.thrust, 0, 'Commanded thrust', COLORS[3])
+        if episode.tracking_time_s is not None:
+            for plot in (self.attitude_plot, self.thrust_plot):
+                plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,
+                                              pen=pg.mkPen('#ffb454', width=2, style=QtCore.Qt.PenStyle.DashLine),
+                                              label='Tracking starts',
+                                              labelOpts={'color': '#ffb454', 'position': .9}))
         self.cursors = []
-        for plot in (self.altitude, self.margins):
+        for plot in (self.altitude, self.margins, self.attitude_plot, self.thrust_plot):
             line = pg.InfiniteLine(0, angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
             plot.addItem(line)
             line.sigPositionChanged.connect(lambda line=line: self.set_cursor(line.value()))
@@ -461,6 +486,8 @@ class Overview(QtWidgets.QMainWindow):
         self.trajectory.enableAutoRange()
         self.altitude.enableAutoRange()
         self.margins.enableAutoRange(axis='y')
+        self.attitude_plot.enableAutoRange()
+        self.thrust_plot.enableAutoRange()
         self.events.setUpdatesEnabled(False)
         with QtCore.QSignalBlocker(self.events):
             self.events.clearSelection()

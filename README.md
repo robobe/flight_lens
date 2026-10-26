@@ -1,8 +1,10 @@
 # FlightLens
 
-Read-only desktop flight analysis for local Bullet MCAP recordings. One **Flight
+Read-only desktop flight analysis for local Bullet MCAP recordings. The **Flight
 Overview** tab combines X–Z trajectory, altitude, bbox edge clearance, an event
-summary and the exact recorded camera frame for a selected event.
+summary and the exact recorded camera frame for a selected event. The **Attitude
+& Thrust** tab plots physical and controller attitude, commanded collective thrust,
+and the start of LOS tracking.
 
 ## Run
 
@@ -37,6 +39,15 @@ Linux/Ubuntu with a working desktop display is the verified environment.
 | Summary | Outcome, recorded duration, peak altitude, first recorded fault, warning/error interval counts and recording integrity |
 | Events | Phase changes, visual rejection and navigation recovery intervals, physics state changes and renderer errors |
 | Event frame | One original image with its bbox, when an exact recorded identity and image are available |
+
+## Attitude & Thrust
+
+The attitude graph shows roll, pitch and yaw in degrees from the recorded physical
+pose and controller feedback when available. The thrust graph shows normalized
+collective thrust reconstructed from the recorded RC command; it is not measured
+delivered motor thrust. A vertical marker identifies the first recorded LOS tracking
+sample (`TRACK` / `LOS_APPROACH`). Missing topics remain visible as unavailable data
+instead of preventing the recording from opening.
 
 Drag the white cursor in either time plot; both plots share time and horizontal
 zoom. The position circle follows that simulation time on the trajectory, and

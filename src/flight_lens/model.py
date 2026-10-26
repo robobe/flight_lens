@@ -98,6 +98,10 @@ class Episode:
     key: tuple[str, str]
     trajectory: Series
     trajectory_origin: str
+    attitude: Series
+    feedback_attitude: Series
+    thrust: Series
+    tracking_time_s: float | None
     barometer: Series
     goal: Series
     margins: Series

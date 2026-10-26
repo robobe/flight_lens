@@ -2,7 +2,7 @@
 from collections import defaultdict
 from dataclasses import replace
 import json
-from math import isfinite
+from math import asin, atan2, isfinite, sqrt
 from pathlib import Path
 from types import MappingProxyType
 
@@ -20,13 +20,14 @@ POSE = 'render/drone_1/pose'
 MISSION = 'app/drone_1/mission'
 BBOX = 'tracking/front/bbox'
 FEEDBACK = 'flight/drone_1/feedback'
+RC = 'flight/drone_1/rc'
 METADATA = 'camera/front/image/metadata'
 STATE = 'simulation/state'
 END = 'scenario/ended'
 PLATFORM = 'flight/drone_1/config'
 RENDER_HEALTH = 'analysis/render/health'
 SCHEMAS = {TRUTH: 'analysis_ground_truth.json', SENSORS: 'analysis_sensors.json', POSE: 'pose.json',
-           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json',
+           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json', RC: 'flight_rc.json',
            METADATA: 'image_metadata.json', STATE: 'state.json', END: 'scenario_end.json',
            PLATFORM: 'flight_config.json', RENDER_HEALTH: 'render_health.json'}
 TAKEOFF_PHASES = {'TAKEOFF', 'HOVER', 'WAIT_TARGET', 'YAW_SEARCH', 'YAW_CENTER', 'YAW_SETTLE'}
@@ -102,14 +103,66 @@ def pose_rows(records, topic):
             for kind, t, _, v in records if kind == topic and t is not None]
 
 
-def build_episode(key, records, frames, boxes, camera, health, partial):
+def attitude(quaternion):
+    try:
+        x, y, z, w = (float(value) for value in quaternion)
+        norm = sqrt(x * x + y * y + z * z + w * w)
+        if norm <= 0:
+            return None
+        x, y, z, w = (value / norm for value in (x, y, z, w))
+        pitch = max(-1., min(1., 2 * (w * y - z * x)))
+        return tuple(np.degrees((atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)),
+                                 asin(pitch), atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def attitude_rows(records, topic):
+    rows = []
+    for kind, t, _, value in records:
+        if kind != topic or t is None:
+            continue
+        quaternion = value.get('ground_truth', {}).get('orientation_xyzw') if topic == TRUTH else value.get('orientation_xyzw')
+        angles = attitude(quaternion)
+        if angles is not None:
+            rows.append((t, angles))
+    return rows
+
+
+def unwrap_attitude(rows):
+    if not rows:
+        return rows
+    times = [t for t, _ in rows]
+    values = np.array([angles for _, angles in rows], dtype=float)
+    values = np.degrees(np.unwrap(np.radians(values), axis=0))
+    return list(zip(times, values))
+
+
+def thrust_value(channel, backend):
+    if type(channel) is not int or not 1000 <= channel <= 2000:
+        return None
+    if backend != 'betaflight':
+        return (channel - 1000) / 10.
+    if channel == 1000:
+        return 0.
+    stick = (channel - 1050) / 950.
+    fraction = .055 + .945 * max(0., min(1., stick))
+    return 100. * fraction * fraction
+
+
+def build_episode(key, records, frames, boxes, camera, health, partial, backend='internal'):
     truth = pose_rows(records, TRUTH)
     origin = 'Actual ground truth' if truth else 'Rendered pose (may use noisy sensor sources)'
     trajectory = series(truth or pose_rows(records, POSE), 3)
-    barometer, feedback_altitude, goals, margins, processed_margins = [], [], [], [], []
+    attitude_rows_actual = unwrap_attitude(attitude_rows(records, TRUTH) or attitude_rows(records, POSE))
+    estimated_rows = unwrap_attitude(attitude_rows(records, FEEDBACK))
+    barometer, feedback_altitude, goals, margins, processed_margins, thrust_rows = [], [], [], [], [], []
     events, contexts = [], []
     active = {}
     outcome = 'Unknown'
+    tracking_time = None
+    sequence_times = {v.get('sequence'): t for topic, t, _, v in records
+                      if topic == MISSION and t is not None and type(v.get('sequence')) is int}
     for topic, t, arrival, v in sorted(records, key=lambda row: row[2]):
         if topic == SENSORS:
             baro = v['sensors'].get('barometer')
@@ -137,6 +190,9 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
             outcome = 'Stopped · ' + v['reason']
         if topic == MISSION:
             phase, reason = v['phase'], v['reason']
+            if tracking_time is None and (phase == 'LOS_APPROACH'
+                                          or (phase.startswith('LOS_') and str(v.get('navigator_state', '')).upper() == 'TRACK')):
+                tracking_time = t
             d = v['diagnostics']
             image, bbox = mission_image(v)
             ref = frames.get(image)
@@ -193,6 +249,11 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
             if active.get('renderer', (None,))[0] != reason:
                 events.append(Event(None, None, arrival, 'error', 'renderer', reason, '', freeze(v)))
                 active['renderer'] = (reason, len(events) - 1)
+        elif topic == RC:
+            sample_time = sequence_times.get(v.get('sequence'))
+            value = thrust_value(v.get('channels', [None] * 3)[2], backend)
+            if sample_time is not None and value is not None:
+                thrust_rows.append((sample_time, (value,)))
     timestamps = [t for _, t, _, _ in records if t is not None]
     contexts = sorted(dict(contexts).items())
     events = tuple(sorted(events, key=lambda e: e.arrival_ns))
@@ -200,6 +261,9 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
     barometer_samples = series(barometer or feedback_altitude)
     goal_samples = series(goals)
     margin_samples = series(margins or processed_margins, 4)
+    attitude_samples = series(attitude_rows_actual, 3)
+    feedback_attitude_samples = series(estimated_rows, 3)
+    thrust_samples = series(thrust_rows)
     notices = []
     drops = [v.get('publisher_drops', 0) for topic, _, _, v in records if topic in (TRUTH, SENSORS)]
     if drops and max(drops):
@@ -214,6 +278,12 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
         notices.append('Exact image identity metadata unavailable; event frames cannot be guessed.')
     if not len(margin_samples.times):
         notices.append('BBox margins unavailable: missing boxes, dimensions or source timestamps.')
+    if not len(attitude_samples.times):
+        notices.append('Physical attitude unavailable: no ground-truth or rendered-pose orientation samples.')
+    if not len(feedback_attitude_samples.times):
+        notices.append('Controller attitude unavailable: no flight feedback orientation samples.')
+    if not len(thrust_samples.times):
+        notices.append('Commanded thrust unavailable: no timestamp-aligned RC samples.')
     integrity = 'Unknown'
     if health:
         integrity = 'Complete (recorder)' if health.get('complete') and not partial else 'Incomplete'
@@ -232,7 +302,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial):
                       (float(np.min(trajectory.values[:, 1])), float(np.max(trajectory.values[:, 1]))) if len(trajectory.times) else None,
                       failures[0].reason if failures else None,
                       sum(e.severity == 'warning' for e in events), len(failures), integrity)
-    return Episode(key, trajectory, origin, barometer_samples, goal_samples,
+    return Episode(key, trajectory, origin, attitude_samples, feedback_attitude_samples, thrust_samples, tracking_time,
+                   barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
                    events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts),
                    tuple(sorted(frames.values(), key=lambda ref: (ref.log_time_ns, ref.record_sequence))),
@@ -243,7 +314,7 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
     path = Path(path).resolve()
     stat = path.stat()
     validators = {topic: Draft202012Validator(json.loads(schema_bytes(name))) for topic, name in SCHEMAS.items()}
-    records, frames, boxes, cameras, stream_physics = [], {}, {}, {}, {}
+    records, frames, boxes, cameras, stream_physics, backends = [], {}, {}, {}, {}, {}
     health, warnings = None, defaultdict(int)
     with path.open('rb') as file:
         reader = make_reader(file, validate_crcs=True)
@@ -276,6 +347,7 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
                     camera = value['camera']
                     cameras[value['physics_id']] = (camera['width_px'], camera['height_px'])
                     stream_physics[value['stream_id']] = value['physics_id']
+                    backends[value['physics_id']] = value.get('backend', 'internal')
                 elif channel.topic == METADATA:
                     metadata = value['metadata']
                     identity = frame_identity(metadata.get('source'), metadata['sequence'])
@@ -293,6 +365,8 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
                         boxes[identity] = tuple(value['bbox'][key] for key in ('x', 'y', 'width', 'height'))
             except (ValueError, TypeError, KeyError, ValidationError, OverflowError):
                 warnings[channel.topic] += 1
+    sequence_times = {(v.get('physics_id'), v.get('episode_id'), v.get('sequence')): v.get('simulation_time_s')
+                      for topic, _, v in records if topic == MISSION}
     grouped = defaultdict(list)
     for topic, arrival, value in records:
         check_cancel(cancel)
@@ -306,6 +380,8 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
         if not physics_id or not episode_id:
             continue
         t = source.get('simulation_time_s')
+        if topic == RC:
+            t = sequence_times.get((physics_id, episode_id, value.get('sequence')))
         if t is not None and (not isinstance(t, (float, int)) or not isfinite(t)):
             warnings[topic] += 1
             t = None
@@ -317,7 +393,8 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
     for key in keys:
         check_cancel(cancel)
         refs = {identity: ref for identity, ref in frames.items() if identity[:2] == key}
-        episodes.append(build_episode(key, grouped[key], refs, boxes, cameras.get(key[0]), health, path.name.endswith('.partial')))
+        episodes.append(build_episode(key, grouped[key], refs, boxes, cameras.get(key[0]), health,
+                                      path.name.endswith('.partial'), backends.get(key[0], 'internal')))
     authoritative = None if health is None else health.get('episode')
     default = len(keys) - 1
     if authoritative and (authoritative['physics_id'], authoritative['episode_id']) in keys:

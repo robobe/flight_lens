@@ -5,7 +5,8 @@ import pytest
 from mcap.writer import Writer
 
 from flight_lens.model import series
-from flight_lens.reader import (load_flight, read_frame, Cancelled, TRUTH, MISSION, METADATA, POSE, BBOX, decode)
+from flight_lens.reader import (load_flight, read_frame, Cancelled, TRUTH, MISSION, METADATA, POSE, BBOX, decode,
+                                thrust_value)
 from conftest import source, mission, truth, pose, health, frame_metadata, write_mcap
 
 
@@ -21,6 +22,10 @@ def test_truth_summary_events_and_exact_frame(flight_file):
     assert episode.barometer.values[:,0].tolist()==[2.5]
     assert episode.goal.values[:,0].tolist()==[3.]
     assert episode.margins.values.tolist()==[[0.,1.,6.,3.]]
+    assert episode.attitude.values[-1,0]==pytest.approx(10., abs=.01)
+    assert episode.feedback_attitude.values[-1,1]==pytest.approx(20., abs=.01)
+    assert episode.thrust.values[:,0].tolist()==[50.]
+    assert episode.tracking_time_s==pytest.approx(.3)
     warnings=[e for e in episode.events if e.severity=='warning']
     assert len(warnings)==2  # Separate rejection intervals, not 100 Hz packet counts.
     assert warnings[0].time_s==.1 and warnings[0].end_s==.2
@@ -35,6 +40,12 @@ def test_truth_summary_events_and_exact_frame(flight_file):
         errors[0].details['phase']='wrong'
     assert episode.context_at(.1)['image_age_s']==.03
     assert episode.context_at(10)=={}
+
+
+def test_thrust_decode_matches_backend_encodings():
+    assert thrust_value(1500, 'internal') == pytest.approx(50.)
+    assert thrust_value(1000, 'betaflight') == pytest.approx(0.)
+    assert thrust_value(2000, 'betaflight') == pytest.approx(100.)
 
 
 def test_clipping_is_not_a_flight_fault(tmp_path):
