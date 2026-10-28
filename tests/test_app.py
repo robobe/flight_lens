@@ -45,9 +45,14 @@ def window(application):
 def test_overview_async_loading_cursor_event_and_frame(window,application,flight_file):
     window.open_file(flight_file)
     until(application,lambda:window.data is not None and not window.jobs)
-    assert window.tabs.count()==5
+    assert window.tabs.count()==6
     assert window.tabs.tabText(2)=='MSP'
-    assert window.tabs.tabText(4)=='Assistant'
+    assert window.tabs.tabText(3)=='Visual'
+    assert window.tabs.tabText(5)=='Assistant'
+    assert window.assistant_query_output.isReadOnly()
+    assert window.assistant_submit.text()=='Run query'
+    assert len(window.visual_plots)==3
+    assert len(window.visual_plots[0].plotItem.legend.items)==1
     assert window.events.rowCount()==len(window.episode.events)
     assert 'Mission fault' in window.cards['Outcome'].text()
     assert window.canvas.source_image is not None

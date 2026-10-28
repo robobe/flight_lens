@@ -67,6 +67,8 @@ def test_assistant_executes_tools_and_returns_validated_chart(flight_file):
 
     assert 'ended normally' in result.text
     assert result.chart['series'][0]['values'] == [1., 2.]
+    assert result.trace[0]['name'] == 'recording_summary'
+    assert result.trace[0]['arguments'] == {}
 
 
 def test_assistant_executes_xml_tool_markup_without_showing_it(flight_file):

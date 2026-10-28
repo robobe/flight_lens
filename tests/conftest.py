@@ -55,6 +55,16 @@ def msp(t, attitude=(0., 0., 0.), episode='episode'):
                 altitude=None, status=None)
 
 
+def los(t, ttc=None, episode='episode'):
+    return dict(schema_version=1, app_id='app', sequence=round(t * 100), source=source(t, round(t * 100), episode),
+                generated_us=10_000_000 + round(t * 1e6), navigation_sequence=1, navigator_state='track',
+                stage='ttc' if ttc is not None else 'bearing', reason='tracking', mission_phase='LOS_APPROACH',
+                active=True, elevation_deg=0., azimuth_deg=0., bearing_valid=True,
+                elevation_rate_deg_s=0., azimuth_rate_deg_s=0., rate_observable=True,
+                optical_ttc_s=ttc, ttc_valid=ttc is not None, ttc_reason='qualified' if ttc is not None else 'insufficient_history',
+                ttc_relative_residual=.02 if ttc is not None else None)
+
+
 def rc(t, throttle=1500, episode='episode'):
     sequence = round(t * 100)
     return dict(schema_version=1, physics_id='physics', episode_id=episode, app_id='app', sequence=sequence,
@@ -108,11 +118,12 @@ def write_mcap(path, records, health_data=None, frames=()):
 
 @pytest.fixture
 def flight_file(tmp_path):
-    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS,FEEDBACK,MSP,RC
+    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS,FEEDBACK,MSP,LOS,RC
     s=source(.1,10)
     diagnostics=dict(vision_reason='clipped_target',processed_image_stream_id='stream',
                      processed_image_sequence=42,processed_image_timestamp_s=s['measurement_us']/1e6,
-                     processed_bbox=[0,1,2,2],edge_margins_px=[0,1,6,3],image_age_s=.03,thrust_saturated=True)
+                     processed_bbox=[0,1,2,2],edge_margins_px=[0,1,6,3],image_age_s=.03,thrust_saturated=True,
+                     target_error_x_px=-2., target_error_y_px=0.)
     baro=dict(episode_id='episode',step_index=10,simulation_time_s=.1,pressure_pa=101000.,altitude_m=2.5)
     sensors=dict(schema_version=1,source=s,publisher_drops=0,sensors=dict(imu=None,barometer=baro,rangefinder=None),attitude_estimate=None)
     records=[(TRUTH,0.,truth(0.,(0.,-1.,1.))), (POSE,.01,pose(0.)),
@@ -122,6 +133,7 @@ def flight_file(tmp_path):
              (TRUTH,.12,truth(.1,(1.,2.,2.),orientation=(.0871557,0.,0.,.9961947),velocity=(3.,0.,4.))),
              (FEEDBACK,.13,feedback(.1,orientation=(0.,.1736482,0.,.9848078))),
              (MSP,.14,msp(.1,(.1,.2,.3))), (MSP,.15,msp(.12,(.12,.22,.32))),
+             (LOS,.16,los(.1,5.)), (LOS,.17,los(.12,4.)),
              (RC,.14,rc(.2,throttle=1500)), (SENSORS,.15,sensors),
              (MISSION,.14,mission(.1,'YAW_SETTLE','settling',diagnostics)),
              (MISSION,.2,mission(.2,'YAW_SETTLE','settling',diagnostics)),

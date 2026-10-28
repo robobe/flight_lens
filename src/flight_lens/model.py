@@ -104,6 +104,10 @@ class Episode:
     feedback_attitude: Series
     msp_attitude: Series
     msp_attitude_estimate: Series
+    ttc_raw: Series
+    ttc_filtered: Series
+    camera_error_x: Series
+    camera_error_y: Series
     thrust: Series
     tracking_time_s: float | None
     barometer: Series

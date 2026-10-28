@@ -22,6 +22,9 @@ ATTITUDE_MEASURED_COLOR = '#58b8f5'
 ATTITUDE_ESTIMATED_COLOR = '#ff8282'
 MSP_MEASURED_COLOR = '#70d6ad'
 MSP_ESTIMATED_COLOR = '#c299f0'
+VISUAL_RAW_COLOR = '#eab85a'
+VISUAL_FILTERED_COLOR = '#70d6ad'
+TTC_DISPLAY_PERCENTILE = 95.
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
 DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
@@ -208,6 +211,8 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.controls, 'Attitude & Thrust')
         self.msp_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.msp_tab, 'MSP')
+        self.visual_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.visual_tab, 'Visual')
         self.velocity_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.velocity_tab, 'Velocity')
         self.assistant_tab = QtWidgets.QWidget()
@@ -342,6 +347,25 @@ class Overview(QtWidgets.QMainWindow):
             self.msp_plots.append(plot)
         for plot in self.msp_plots[1:]:
             plot.setXLink(self.msp_plots[0])
+        visual_layout = QtWidgets.QVBoxLayout(self.visual_tab)
+        visual_layout.setContentsMargins(12, 12, 12, 12)
+        self.visual_status = QtWidgets.QLabel('Visual telemetry · TTC and camera-center errors')
+        self.visual_status.setStyleSheet('color:#9bb0c8; padding:3px')
+        visual_layout.addWidget(self.visual_status)
+        self.visual_plots = []
+        for title, label, unit in (('Time to contact · ttc_valid=true', 'TTC', 's'),
+                                   ('Camera-center X error', 'X error', 'px'),
+                                   ('Camera-center Y error', 'Y error', 'px')):
+            plot = pg.PlotWidget(title=title)
+            plot.setLabel('left', label, units=unit)
+            plot.setLabel('bottom', 'Simulation time', units='s')
+            plot.getAxis('left').setWidth(76)
+            plot.showGrid(x=True, y=True, alpha=.15)
+            plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+            visual_layout.addWidget(plot)
+            self.visual_plots.append(plot)
+        for plot in self.visual_plots[1:]:
+            plot.setXLink(self.visual_plots[0])
         velocity_layout = QtWidgets.QVBoxLayout(self.velocity_tab)
         velocity_layout.setContentsMargins(12, 12, 12, 12)
         self.velocity_plots = []
@@ -397,6 +421,13 @@ class Overview(QtWidgets.QMainWindow):
         self.assistant_transcript.setReadOnly(True)
         self.assistant_transcript.setPlaceholderText('Assistant answers will appear here.')
         left_layout.addWidget(self.assistant_transcript, 1)
+        left_layout.addWidget(QtWidgets.QLabel('Generated queries and results'))
+        self.assistant_query_output = QtWidgets.QPlainTextEdit()
+        self.assistant_query_output.setReadOnly(True)
+        self.assistant_query_output.setPlaceholderText('Tool queries and bounded data results will appear here.')
+        self.assistant_query_output.setMaximumHeight(180)
+        self.assistant_query_output.setStyleSheet('font:10px monospace; background:#101c2a')
+        left_layout.addWidget(self.assistant_query_output)
         self.assistant_prompt = QtWidgets.QLineEdit()
         self.assistant_prompt.setPlaceholderText('Ask about the selected episode…')
         self.assistant_prompt.returnPressed.connect(self.ask_assistant)
@@ -405,7 +436,7 @@ class Overview(QtWidgets.QMainWindow):
         self.assistant_graph = QtWidgets.QCheckBox('Show result as graph')
         self.assistant_graph.setChecked(True)
         controls.addWidget(self.assistant_graph)
-        self.assistant_submit = QtWidgets.QPushButton('Ask')
+        self.assistant_submit = QtWidgets.QPushButton('Run query')
         self.assistant_submit.clicked.connect(self.ask_assistant)
         controls.addWidget(self.assistant_submit)
         self.assistant_cancel = QtWidgets.QPushButton('Cancel')
@@ -455,6 +486,11 @@ class Overview(QtWidgets.QMainWindow):
 
     def _append_assistant(self, speaker, text):
         self.assistant_transcript.appendPlainText(f'{speaker}: {text}')
+
+    def _show_assistant_trace(self, trace):
+        self.assistant_query_output.setPlainText('\n\n'.join(
+            f"{item['name']}({json.dumps(item['arguments'], sort_keys=True)})\n"
+            f"{json.dumps(item['result'], indent=2, sort_keys=True)}" for item in trace))
 
     def _show_assistant_chart(self, chart):
         self.assistant_plot.clear()
@@ -569,6 +605,7 @@ class Overview(QtWidgets.QMainWindow):
             self.canvas.show_frame(frame, bbox)
         elif job.kind == 'assistant' and job.token == self.assistant_token:
             self._append_assistant('FlightLens', result.text)
+            self._show_assistant_trace(result.trace)
             self._show_assistant_chart(result.chart)
             self.assistant_status.setText('Ready.')
 
@@ -649,6 +686,7 @@ class Overview(QtWidgets.QMainWindow):
         self.episode = episode = self.data.episodes[index]
         if hasattr(self, 'assistant_plot'):
             self.assistant_plot.clear()
+            self.assistant_query_output.clear()
         summary = episode.summary
         number = lambda value: 'Unavailable' if value is None else f'{value:.2f} m'
         values = {'Outcome': summary.outcome, 'Duration': f'{summary.duration_s:.2f} s',
@@ -658,7 +696,7 @@ class Overview(QtWidgets.QMainWindow):
             self.cards[title].setText(title + '\n' + value)
         y_range = '' if summary.y_range_m is None else f' · World Y range {summary.y_range_m[0]:+.2f}…{summary.y_range_m[1]:+.2f} m'
         self.notices.setText(episode.trajectory_origin + y_range + '\n' + ' '.join((*self.data.notices, *episode.notices)))
-        for plot in (self.trajectory, self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.velocity_plots):
+        for plot in (self.trajectory, self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.visual_plots, *self.velocity_plots):
             plot.clear()
         tx, x = episode.trajectory.plot(0)
         _, z = episode.trajectory.plot(2)
@@ -689,6 +727,25 @@ class Overview(QtWidgets.QMainWindow):
             self._curve(plot, episode.attitude, column, 'Physical reference ' + name, ATTITUDE_MEASURED_COLOR)
             self._curve(plot, episode.feedback_attitude, column, 'Controller feedback ' + name,
                         ATTITUDE_ESTIMATED_COLOR, dashed=True)
+        if len(episode.ttc_raw.times) or len(episode.ttc_filtered.times):
+            if len(episode.ttc_raw.times):
+                self._curve(self.visual_plots[0], episode.ttc_raw, 0, 'Raw TTC', VISUAL_RAW_COLOR)
+            if len(episode.ttc_filtered.times):
+                self._curve(self.visual_plots[0], episode.ttc_filtered, 0, 'Filtered TTC', VISUAL_FILTERED_COLOR, dashed=True)
+        if len(episode.camera_error_x.times):
+            self._curve(self.visual_plots[1], episode.camera_error_x, 0, 'X error from camera center', VISUAL_RAW_COLOR)
+        if len(episode.camera_error_y.times):
+            self._curve(self.visual_plots[2], episode.camera_error_y, 0, 'Y error from camera center', VISUAL_RAW_COLOR)
+        ttc_label = 'raw and filtered TTC' if len(episode.ttc_raw.times) and len(episode.ttc_filtered.times) \
+            else 'filtered TTC' if len(episode.ttc_filtered.times) else 'TTC unavailable'
+        ttc_values = np.concatenate((episode.ttc_raw.values[:, 0], episode.ttc_filtered.values[:, 0])) \
+            if len(episode.ttc_raw.times) or len(episode.ttc_filtered.times) else np.array([])
+        if len(ttc_values):
+            display_max = max(1., float(np.percentile(ttc_values, TTC_DISPLAY_PERCENTILE)))
+            self.visual_plots[0].setYRange(0., display_max, padding=.05)
+            if float(np.max(ttc_values)) > display_max:
+                ttc_label += f' · axis clipped above {display_max:.1f} s'
+        self.visual_status.setText(f'Visual telemetry · {ttc_label}; camera-center error from recorded detections')
         self._curve(self.thrust_plot, episode.thrust, 0, 'Commanded thrust', COLORS[3])
         for column, (plot, axis) in enumerate(zip(self.velocity_plots, ('X', 'Y', 'Z'))):
             self._curve(plot, episode.velocity, column, 'Ground truth ' + axis, COLORS[column])
@@ -698,13 +755,13 @@ class Overview(QtWidgets.QMainWindow):
             episode.velocity.times, np.hypot(episode.velocity.values[:, 0], episode.velocity.values[:, 2])))
         self._curve(self.velocity_plots[3], slant_velocity, 0, 'Ground truth X–Z speed', COLORS[3])
         if episode.tracking_time_s is not None:
-            for plot in (*self.attitude_plots, *self.msp_plots, self.thrust_plot):
+            for plot in (*self.attitude_plots, *self.msp_plots, *self.visual_plots, self.thrust_plot):
                 plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,
                                               pen=pg.mkPen('#ffb454', width=2, style=QtCore.Qt.PenStyle.DashLine),
                                               label='Tracking starts',
                                               labelOpts={'color': '#ffb454', 'position': .9}))
         self.cursors = []
-        for plot in (self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.velocity_plots):
+        for plot in (self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.visual_plots, *self.velocity_plots):
             line = pg.InfiniteLine(0, angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
             plot.addItem(line)
             line.sigPositionChanged.connect(lambda line=line: self.set_cursor(line.value()))
@@ -716,6 +773,10 @@ class Overview(QtWidgets.QMainWindow):
             plot.enableAutoRange()
         for plot in self.msp_plots:
             plot.enableAutoRange()
+        for plot in self.visual_plots:
+            plot.enableAutoRange()
+        if len(ttc_values):
+            self.visual_plots[0].setYRange(0., display_max, padding=.05)
         self.thrust_plot.enableAutoRange()
         for plot in self.velocity_plots:
             plot.enableAutoRange()

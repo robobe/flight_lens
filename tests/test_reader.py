@@ -30,6 +30,9 @@ def test_truth_summary_events_and_exact_frame(flight_file):
     assert episode.velocity.values[-1].tolist()==[3.,0.,4.]
     assert len(episode.barometer_velocity.times)==0
     assert episode.thrust.values[:,0].tolist()==[50.]
+    assert episode.ttc_filtered.values[:,0].tolist()==[5.,4.]
+    assert set(episode.camera_error_x.values[:,0].tolist()) == {-2.}
+    assert set(episode.camera_error_y.values[:,0].tolist()) == {0.}
     assert episode.tracking_time_s==pytest.approx(.3)
     warnings=[e for e in episode.events if e.severity=='warning']
     assert len(warnings)==2  # Separate rejection intervals, not 100 Hz packet counts.

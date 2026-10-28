@@ -34,6 +34,7 @@ class AssistantCancelled(Exception):
 class AssistantResult:
     text: str
     chart: dict | None = None
+    trace: tuple = ()
 
 
 def _bounded_series(series: Series, max_points=MAX_QUERY_POINTS):
@@ -257,6 +258,7 @@ class McapAssistant:
 
     def answer(self, data, episode, prompt, cancel=lambda: False, progress=lambda message: None):
         tools = McapAnalysisTools(data, episode)
+        trace = []
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
         for _ in range(MAX_TOOL_ROUNDS):
             if cancel():
@@ -269,12 +271,14 @@ class McapAssistant:
             messages.append(message)
             if not tool_calls:
                 text = str(message.get('content') or '').strip()
-                return AssistantResult(text[:MAX_RESPONSE_CHARS], extract_chart(text))
+                return AssistantResult(text[:MAX_RESPONSE_CHARS], extract_chart(text), tuple(trace))
             for call in tool_calls:
                 if cancel():
                     raise AssistantCancelled()
                 function = call['function']
-                result = tools.call(function['name'], json.loads(function.get('arguments') or '{}'))
+                arguments = json.loads(function.get('arguments') or '{}')
+                result = tools.call(function['name'], arguments)
+                trace.append(dict(name=function['name'], arguments=arguments, result=result))
                 messages.append({'role': 'tool', 'tool_call_id': call.get('id', function['name']),
                                  'name': function['name'], 'content': _tool_content(result)})
         raise RuntimeError('assistant exceeded the tool-call limit')

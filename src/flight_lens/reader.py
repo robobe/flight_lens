@@ -23,6 +23,7 @@ MISSION = 'app/drone_1/mission'
 BBOX = 'tracking/front/bbox'
 FEEDBACK = 'flight/drone_1/feedback'
 MSP = 'analysis/app/msp'
+LOS = 'tracking/front/los'
 RC = 'flight/drone_1/rc'
 METADATA = 'camera/front/image/metadata'
 STATE = 'simulation/state'
@@ -30,7 +31,7 @@ END = 'scenario/ended'
 PLATFORM = 'flight/drone_1/config'
 RENDER_HEALTH = 'analysis/render/health'
 SCHEMAS = {TRUTH: 'analysis_ground_truth.json', SENSORS: 'analysis_sensors.json', POSE: 'pose.json',
-           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json', MSP: 'analysis_msp.json', RC: 'flight_rc.json',
+           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json', MSP: 'analysis_msp.json', LOS: 'los_telemetry.json', RC: 'flight_rc.json',
            METADATA: 'image_metadata.json', STATE: 'state.json', END: 'scenario_end.json',
            PLATFORM: 'flight_config.json', RENDER_HEALTH: 'render_health.json'}
 TAKEOFF_PHASES = {'TAKEOFF', 'HOVER', 'WAIT_TARGET', 'YAW_SEARCH', 'YAW_CENTER', 'YAW_SETTLE'}
@@ -183,6 +184,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     estimated_rows = unwrap_attitude(attitude_rows(records, FEEDBACK))
     msp_rows = msp_attitude_rows(records)
     barometer, feedback_altitude, goals, margins, processed_margins, thrust_rows = [], [], [], [], [], []
+    ttc_raw_rows, ttc_filtered_rows, camera_error_x_rows, camera_error_y_rows = [], [], [], []
     events, contexts = [], []
     active = {}
     outcome = 'Unknown'
@@ -196,6 +198,13 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
                 barometer.append((baro['simulation_time_s'], (baro['altitude_m'],)))
         elif topic == FEEDBACK and t is not None and v['barometer_altitude_m'] is not None:
             feedback_altitude.append((t, (v['barometer_altitude_m'],)))
+        elif topic == LOS and t is not None:
+            filtered = v.get('optical_ttc_s')
+            if v.get('ttc_valid') and v.get('ttc_reason') == 'qualified' and filtered is not None:
+                ttc_filtered_rows.append((t, (filtered,)))
+            raw = v.get('optical_ttc_raw_s', v.get('ttc_raw_s'))
+            if raw is not None:
+                ttc_raw_rows.append((t, (raw,)))
         elif topic == BBOX and t is not None and v['bbox'] is not None:
             box = v['bbox']
             identity = frame_identity(v.get('source'), v['sequence'])
@@ -220,6 +229,19 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
                                           or (phase.startswith('LOS_') and str(v.get('navigator_state', '')).upper() == 'TRACK')):
                 tracking_time = t
             d = v['diagnostics']
+            raw_ttc = d.get('optical_ttc_raw_s', d.get('ttc_raw_s'))
+            if t is not None and isinstance(raw_ttc, (int, float)) and isfinite(raw_ttc) and raw_ttc > 0:
+                ttc_raw_rows.append((t, (raw_ttc,)))
+            if t is not None:
+                x_error = d.get('target_error_x_px')
+                bbox = d.get('processed_bbox')
+                y_error = d.get('target_error_y_px')
+                if y_error is None and isinstance(bbox, (list, tuple)) and len(bbox) == 4 and camera is not None:
+                    y_error = bbox[1] + bbox[3] / 2. - camera[1] / 2.
+                if isinstance(x_error, (int, float)) and isfinite(x_error):
+                    camera_error_x_rows.append((t, (x_error,)))
+                if isinstance(y_error, (int, float)) and isfinite(y_error):
+                    camera_error_y_rows.append((t, (y_error,)))
             image, bbox = mission_image(v)
             ref = frames.get(image)
             bbox = bbox if bbox is not None else boxes.get(image)
@@ -294,6 +316,10 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     msp_attitude_samples = series(msp_rows, 3)
     estimate_times, estimate_values = estimate_attitude(msp_rows)
     msp_attitude_estimate = series(zip(estimate_times, estimate_values), 3)
+    ttc_raw_samples = series(ttc_raw_rows)
+    ttc_filtered_samples = series(ttc_filtered_rows)
+    camera_error_x_samples = series(camera_error_x_rows)
+    camera_error_y_samples = series(camera_error_y_rows)
     thrust_samples = series(thrust_rows)
     notices = []
     drops = [v.get('publisher_drops', 0) for topic, _, _, v in records if topic in (TRUTH, SENSORS)]
@@ -341,6 +367,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
                       sum(e.severity == 'warning' for e in events), len(failures), integrity)
     return Episode(key, trajectory, origin, velocity_samples, barometer_velocity_samples,
                    attitude_samples, feedback_attitude_samples, msp_attitude_samples, msp_attitude_estimate,
+                   ttc_raw_samples, ttc_filtered_samples, camera_error_x_samples, camera_error_y_samples,
                    thrust_samples, tracking_time,
                    barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
@@ -444,7 +471,8 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
     index_path = existing_index or build_index(path, records, episodes)
     derived_names = (
         'trajectory_x', 'trajectory_y', 'trajectory_z', 'velocity_x', 'velocity_y', 'velocity_z',
-        'barometer_altitude', 'vertical_speed', 'thrust', 'attitude_roll', 'attitude_pitch', 'attitude_yaw',
+        'barometer_altitude', 'vertical_speed', 'thrust', 'ttc_raw', 'ttc_filtered', 'camera_error_x', 'camera_error_y',
+        'attitude_roll', 'attitude_pitch', 'attitude_yaw',
         'feedback_attitude_roll', 'feedback_attitude_pitch', 'feedback_attitude_yaw', 'msp_attitude_roll',
         'msp_attitude_pitch', 'msp_attitude_yaw', 'msp_kalman_roll', 'msp_kalman_pitch', 'msp_kalman_yaw')
     def indexed_matrix(indexed, names, fallback):
@@ -468,7 +496,11 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
             msp_attitude_estimate=indexed_matrix(indexed, ('msp_kalman_roll', 'msp_kalman_pitch', 'msp_kalman_yaw'), episode.msp_attitude_estimate),
             barometer=indexed_scalar(indexed, 'barometer_altitude', episode.barometer),
             barometer_velocity=indexed_scalar(indexed, 'vertical_speed', episode.barometer_velocity),
-            thrust=indexed_scalar(indexed, 'thrust', episode.thrust))
+            thrust=indexed_scalar(indexed, 'thrust', episode.thrust),
+            ttc_raw=indexed_scalar(indexed, 'ttc_raw', episode.ttc_raw),
+            ttc_filtered=indexed_scalar(indexed, 'ttc_filtered', episode.ttc_filtered),
+            camera_error_x=indexed_scalar(indexed, 'camera_error_x', episode.camera_error_x),
+            camera_error_y=indexed_scalar(indexed, 'camera_error_y', episode.camera_error_y))
     return FlightData(path, stat.st_size, stat.st_mtime_ns, tuple(episodes), default, notices,
                       camera_image_count, index_path)
 
