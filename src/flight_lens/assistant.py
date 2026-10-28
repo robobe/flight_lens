@@ -7,6 +7,7 @@ import re
 import numpy as np
 
 from .model import Episode, FlightData, Series
+from .sqlite_index import list_fields, query_fields
 
 
 MAX_QUERY_POINTS = 80
@@ -82,6 +83,12 @@ class McapAnalysisTools:
         if name == 'query_series':
             return self.query_series(arguments.get('name'), arguments.get('start_time_s'),
                                      arguments.get('end_time_s'), arguments.get('max_points', MAX_QUERY_POINTS))
+        if name == 'query_data':
+            return self.query_data(arguments.get('fields'), arguments.get('start_time_s'),
+                                   arguments.get('end_time_s'), arguments.get('max_points', MAX_QUERY_POINTS),
+                                   arguments.get('aggregation', 'raw'))
+        if name == 'list_series':
+            return self.list_series()
         if name == 'context_at':
             return self.context_at(arguments.get('time_s'))
         raise ValueError(f'unknown analysis tool: {name}')
@@ -121,17 +128,32 @@ class McapAnalysisTools:
             raise ValueError('time_s must be finite')
         return dict(time_s=time_s, context=dict(self.episode.context_at(time_s)))
 
+    def query_data(self, fields, start_time_s=None, end_time_s=None, max_points=MAX_QUERY_POINTS, aggregation='raw'):
+        if self.data.index_path is None:
+            raise ValueError('recording index is unavailable')
+        return dict(aggregation=aggregation, fields=query_fields(
+            self.data.index_path, self.episode.key, fields, start_time_s, end_time_s,
+            max_points, aggregation))
+
+    def list_series(self):
+        if self.data.index_path is None:
+            raise ValueError('recording index is unavailable')
+        return list_fields(self.data.index_path, self.episode.key)
+
 
 TOOL_DEFINITIONS = [
     {'type': 'function', 'function': {'name': 'recording_summary', 'description': 'Return the selected flight summary.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'find_events', 'description': 'Find recorded flight events.', 'parameters': {'type': 'object', 'properties': {'severity': {'type': 'string', 'enum': ['info', 'warning', 'error']}, 'limit': {'type': 'integer', 'maximum': MAX_EVENTS}}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'query_series', 'description': 'Return bounded numeric telemetry samples. Names include x, z, slant, altitude, vertical_speed, attitude_roll, attitude_pitch, attitude_yaw, and thrust.', 'parameters': {'type': 'object', 'required': ['name'], 'properties': {'name': {'type': 'string', 'enum': SERIES_NAMES}, 'start_time_s': {'type': 'number'}, 'end_time_s': {'type': 'number'}, 'max_points': {'type': 'integer', 'maximum': MAX_QUERY_POINTS}}, 'additionalProperties': False}}},
+    {'type': 'function', 'function': {'name': 'query_data', 'description': 'Query bounded numeric telemetry fields from the indexed recording. Use topic and JSON field path from the recording.', 'parameters': {'type': 'object', 'required': ['fields'], 'properties': {'fields': {'type': 'array', 'minItems': 1, 'maxItems': 8, 'items': {'type': 'object', 'required': ['topic', 'path'], 'properties': {'topic': {'type': 'string'}, 'path': {'type': 'string'}, 'name': {'type': 'string'}}, 'additionalProperties': False}}, 'start_time_s': {'type': 'number'}, 'end_time_s': {'type': 'number'}, 'max_points': {'type': 'integer', 'maximum': 500}, 'aggregation': {'type': 'string', 'enum': ['raw', 'mean', 'min', 'max', 'rms']}}, 'additionalProperties': False}}},
+    {'type': 'function', 'function': {'name': 'list_series', 'description': 'List numeric topic and JSON field paths available in the indexed episode.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'context_at', 'description': 'Return recorded context near a simulation time.', 'parameters': {'type': 'object', 'required': ['time_s'], 'properties': {'time_s': {'type': 'number'}}, 'additionalProperties': False}}},
 ]
 
 
 SYSTEM_PROMPT = """You are FlightLens, a read-only flight-recording analyst.
 Use the provided analysis tools instead of guessing. Never claim data that was not returned by a tool.
+Use query_series for common aliases and query_data for indexed topic/field paths.
 Keep answers concise and reference simulation times when useful.
 If a graph helps, return one JSON object in a fenced json block with this shape:
 {"type":"line_chart","title":"...","x_label":"Simulation time","x_unit":"s","x":[...],"series":[{"name":"...","unit":"...","values":[...]}]}

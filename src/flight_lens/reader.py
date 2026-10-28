@@ -14,6 +14,7 @@ from mcap.reader import make_reader
 
 from .model import Episode, Event, FlightData, Frame, FrameRef, Summary, series
 from .estimator import estimate_attitude
+from .sqlite_index import build_index, read_derived, validate_index
 
 TRUTH = 'analysis/physics/ground_truth'
 SENSORS = 'analysis/physics/sensors'
@@ -351,6 +352,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
 def load_flight(path, progress=lambda message: None, cancel=lambda: False):
     path = Path(path).resolve()
     stat = path.stat()
+    existing_index = validate_index(path)
     validators = {topic: Draft202012Validator(json.loads(schema_bytes(name))) for topic, name in SCHEMAS.items()}
     records, frames, boxes, cameras, stream_physics, backends = [], {}, {}, {}, {}, {}
     health, warnings = None, defaultdict(int)
@@ -439,7 +441,36 @@ def load_flight(path, progress=lambda message: None, cancel=lambda: False):
         default = keys.index((authoritative['physics_id'], authoritative['episode_id']))
     notices = tuple(f'{count:,} unsupported or invalid messages skipped on {topic}.' for topic, count in warnings.items())
     progress(f'Loaded {len(records):,} scalar messages; images remain on disk.')
-    return FlightData(path, stat.st_size, stat.st_mtime_ns, tuple(episodes), default, notices, camera_image_count)
+    index_path = existing_index or build_index(path, records, episodes)
+    derived_names = (
+        'trajectory_x', 'trajectory_y', 'trajectory_z', 'velocity_x', 'velocity_y', 'velocity_z',
+        'barometer_altitude', 'vertical_speed', 'thrust', 'attitude_roll', 'attitude_pitch', 'attitude_yaw',
+        'feedback_attitude_roll', 'feedback_attitude_pitch', 'feedback_attitude_yaw', 'msp_attitude_roll',
+        'msp_attitude_pitch', 'msp_attitude_yaw', 'msp_kalman_roll', 'msp_kalman_pitch', 'msp_kalman_yaw')
+    def indexed_matrix(indexed, names, fallback):
+        columns = [series(indexed[name]) for name in names]
+        if not columns[0].times.size or not all(np.array_equal(column.times, columns[0].times) for column in columns[1:]):
+            return fallback
+        values = np.column_stack([column.values[:, 0] for column in columns])
+        values.setflags(write=False)
+        return type(fallback)(columns[0].times, values)
+    def indexed_scalar(indexed, name, fallback):
+        sample = series(indexed[name])
+        return sample if sample.times.size else fallback
+    for index, episode in enumerate(episodes):
+        indexed = read_derived(index_path, episode.key, derived_names)
+        episodes[index] = replace(episode,
+            trajectory=indexed_matrix(indexed, ('trajectory_x', 'trajectory_y', 'trajectory_z'), episode.trajectory),
+            velocity=indexed_matrix(indexed, ('velocity_x', 'velocity_y', 'velocity_z'), episode.velocity),
+            attitude=indexed_matrix(indexed, ('attitude_roll', 'attitude_pitch', 'attitude_yaw'), episode.attitude),
+            feedback_attitude=indexed_matrix(indexed, ('feedback_attitude_roll', 'feedback_attitude_pitch', 'feedback_attitude_yaw'), episode.feedback_attitude),
+            msp_attitude=indexed_matrix(indexed, ('msp_attitude_roll', 'msp_attitude_pitch', 'msp_attitude_yaw'), episode.msp_attitude),
+            msp_attitude_estimate=indexed_matrix(indexed, ('msp_kalman_roll', 'msp_kalman_pitch', 'msp_kalman_yaw'), episode.msp_attitude_estimate),
+            barometer=indexed_scalar(indexed, 'barometer_altitude', episode.barometer),
+            barometer_velocity=indexed_scalar(indexed, 'vertical_speed', episode.barometer_velocity),
+            thrust=indexed_scalar(indexed, 'thrust', episode.thrust))
+    return FlightData(path, stat.st_size, stat.st_mtime_ns, tuple(episodes), default, notices,
+                      camera_image_count, index_path)
 
 
 def check_file(data):

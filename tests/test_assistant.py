@@ -23,6 +23,11 @@ def test_mcap_tools_return_bounded_summary_and_series(flight_file):
     with pytest.raises(ValueError, match='unknown'):
         tools.call('query_series', {'name': 'raw_payload'})
 
+    queried = tools.call('query_data', {'fields': [{'topic': 'analysis/app/msp', 'path': 'attitude.yaw_rad'}],
+                                        'start_time_s': .1, 'end_time_s': .12, 'max_points': 10})
+    assert queried['fields'][0]['times'] == [.1, .12]
+    assert {'topic': 'analysis/app/msp', 'path': 'attitude.yaw_rad'} in tools.call('list_series', {})
+
 
 class FakeBackend:
     def __init__(self):

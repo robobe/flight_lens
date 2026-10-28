@@ -7,11 +7,14 @@ from mcap.writer import Writer
 from flight_lens.model import series
 from flight_lens.reader import (load_flight, read_frame, Cancelled, TRUTH, MISSION, METADATA, POSE, BBOX, decode,
                                 derivative, thrust_value)
+from flight_lens.sqlite_index import sidecar_path
 from conftest import source, mission, truth, pose, health, frame_metadata, write_mcap
 
 
 def test_truth_summary_events_and_exact_frame(flight_file):
     data=load_flight(flight_file)
+    assert data.index_path == sidecar_path(flight_file)
+    assert data.index_path.exists()
     episode=data.episodes[data.default_episode]
     assert episode.trajectory_origin=='Actual ground truth'
     assert episode.trajectory.values.tolist()==[[0.,-1.,1.],[1.,2.,2.]]
@@ -124,6 +127,14 @@ def test_cancel_errors_changed_file_and_partial(flight_file,tmp_path):
     assert load_flight(partial).episodes[0].summary.integrity=='Incomplete'
     with pytest.raises(ValueError):
         decode(b'{"x":1e999}')
+
+
+def test_stale_sidecar_is_rejected(flight_file):
+    load_flight(flight_file)
+    with flight_file.open('ab') as file:
+        file.write(b'changed')
+    with pytest.raises(ValueError, match='Index is stale'):
+        load_flight(flight_file)
 
 
 def test_invalid_optional_diagnostics_do_not_break_loading(tmp_path):

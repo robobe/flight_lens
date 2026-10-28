@@ -136,3 +136,4 @@ class FlightData:
     default_episode: int
     notices: tuple[str, ...]
     camera_image_count: int | None = None
+    index_path: Path | None = None
