@@ -45,8 +45,9 @@ def window(application):
 def test_overview_async_loading_cursor_event_and_frame(window,application,flight_file):
     window.open_file(flight_file)
     until(application,lambda:window.data is not None and not window.jobs)
-    assert window.tabs.count()==4
-    assert window.tabs.tabText(3)=='Assistant'
+    assert window.tabs.count()==5
+    assert window.tabs.tabText(2)=='MSP'
+    assert window.tabs.tabText(4)=='Assistant'
     assert window.events.rowCount()==len(window.episode.events)
     assert 'Mission fault' in window.cards['Outcome'].text()
     assert window.canvas.source_image is not None
@@ -78,6 +79,9 @@ def test_overview_async_loading_cursor_event_and_frame(window,application,flight
         measured = next(curve for curve in plot.listDataItems() if curve.name().startswith('Measured '))
         estimated = next(curve for curve in plot.listDataItems() if curve.name().startswith('Estimated '))
         assert measured.opts['pen'].color().name() != estimated.opts['pen'].color().name()
+    assert len(window.msp_plots)==3
+    assert all(len(plot.plotItem.legend.items)==4 for plot in window.msp_plots)
+    assert 'measured at the firmware response timestamps' in window.msp_status.text()
     assert len(window.thrust_plot.plotItem.legend.items)==1
     assert len(window.velocity_plots)==4
     assert all(len(plot.plotItem.legend.items)==1 for plot in window.velocity_plots[:2])

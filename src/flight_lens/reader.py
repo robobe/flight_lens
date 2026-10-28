@@ -13,6 +13,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from mcap.reader import make_reader
 
 from .model import Episode, Event, FlightData, Frame, FrameRef, Summary, series
+from .estimator import estimate_attitude
 
 TRUTH = 'analysis/physics/ground_truth'
 SENSORS = 'analysis/physics/sensors'
@@ -20,6 +21,7 @@ POSE = 'render/drone_1/pose'
 MISSION = 'app/drone_1/mission'
 BBOX = 'tracking/front/bbox'
 FEEDBACK = 'flight/drone_1/feedback'
+MSP = 'analysis/app/msp'
 RC = 'flight/drone_1/rc'
 METADATA = 'camera/front/image/metadata'
 STATE = 'simulation/state'
@@ -27,7 +29,7 @@ END = 'scenario/ended'
 PLATFORM = 'flight/drone_1/config'
 RENDER_HEALTH = 'analysis/render/health'
 SCHEMAS = {TRUTH: 'analysis_ground_truth.json', SENSORS: 'analysis_sensors.json', POSE: 'pose.json',
-           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json', RC: 'flight_rc.json',
+           MISSION: 'mission.json', BBOX: 'bbox.json', FEEDBACK: 'flight_feedback.json', MSP: 'analysis_msp.json', RC: 'flight_rc.json',
            METADATA: 'image_metadata.json', STATE: 'state.json', END: 'scenario_end.json',
            PLATFORM: 'flight_config.json', RENDER_HEALTH: 'render_health.json'}
 TAKEOFF_PHASES = {'TAKEOFF', 'HOVER', 'WAIT_TARGET', 'YAW_SEARCH', 'YAW_CENTER', 'YAW_SETTLE'}
@@ -150,6 +152,15 @@ def unwrap_attitude(rows):
     return list(zip(times, values))
 
 
+def msp_attitude_rows(records):
+    rows = []
+    for kind, t, _, value in records:
+        sample = value.get('attitude') if kind == MSP else None
+        if t is not None and sample is not None:
+            rows.append((t, (np.degrees(sample['roll_rad']), np.degrees(sample['pitch_rad']), np.degrees(sample['yaw_rad']))))
+    return unwrap_attitude(rows)
+
+
 def thrust_value(channel, backend):
     if type(channel) is not int or not 1000 <= channel <= 2000:
         return None
@@ -169,6 +180,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     velocity_rows_actual = velocity_rows(records)
     attitude_rows_actual = unwrap_attitude(attitude_rows(records, TRUTH) or attitude_rows(records, POSE))
     estimated_rows = unwrap_attitude(attitude_rows(records, FEEDBACK))
+    msp_rows = msp_attitude_rows(records)
     barometer, feedback_altitude, goals, margins, processed_margins, thrust_rows = [], [], [], [], [], []
     events, contexts = [], []
     active = {}
@@ -278,6 +290,9 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     margin_samples = series(margins or processed_margins, 4)
     attitude_samples = series(attitude_rows_actual, 3)
     feedback_attitude_samples = series(estimated_rows, 3)
+    msp_attitude_samples = series(msp_rows, 3)
+    estimate_times, estimate_values = estimate_attitude(msp_rows)
+    msp_attitude_estimate = series(zip(estimate_times, estimate_values), 3)
     thrust_samples = series(thrust_rows)
     notices = []
     drops = [v.get('publisher_drops', 0) for topic, _, _, v in records if topic in (TRUTH, SENSORS)]
@@ -297,6 +312,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
         notices.append('Physical attitude unavailable: no ground-truth or rendered-pose orientation samples.')
     if not len(feedback_attitude_samples.times):
         notices.append('Controller attitude unavailable: no flight feedback orientation samples.')
+    if not len(msp_attitude_samples.times):
+        notices.append('Betaflight MSP attitude unavailable: no valid analysis/app/msp attitude samples.')
     if not len(thrust_samples.times):
         notices.append('Commanded thrust unavailable: no timestamp-aligned RC samples.')
     if not len(velocity_samples.times):
@@ -322,7 +339,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
                       failures[0].reason if failures else None,
                       sum(e.severity == 'warning' for e in events), len(failures), integrity)
     return Episode(key, trajectory, origin, velocity_samples, barometer_velocity_samples,
-                   attitude_samples, feedback_attitude_samples, thrust_samples, tracking_time,
+                   attitude_samples, feedback_attitude_samples, msp_attitude_samples, msp_attitude_estimate,
+                   thrust_samples, tracking_time,
                    barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
                    events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts),

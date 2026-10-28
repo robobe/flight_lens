@@ -20,6 +20,8 @@ from .assistant import LlamaCppBackend, McapAssistant
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
 ATTITUDE_MEASURED_COLOR = '#58b8f5'
 ATTITUDE_ESTIMATED_COLOR = '#ff8282'
+MSP_MEASURED_COLOR = '#70d6ad'
+MSP_ESTIMATED_COLOR = '#c299f0'
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
 DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
@@ -204,6 +206,8 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.content, 'Flight Overview')
         self.controls = QtWidgets.QWidget()
         self.tabs.addTab(self.controls, 'Attitude & Thrust')
+        self.msp_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.msp_tab, 'MSP')
         self.velocity_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.velocity_tab, 'Velocity')
         self.assistant_tab = QtWidgets.QWidget()
@@ -321,6 +325,23 @@ class Overview(QtWidgets.QMainWindow):
             controls_layout.addWidget(plot)
         for plot in self.attitude_plots[1:] + [self.thrust_plot]:
             plot.setXLink(self.attitude_plots[0])
+        msp_layout = QtWidgets.QVBoxLayout(self.msp_tab)
+        msp_layout.setContentsMargins(12, 12, 12, 12)
+        self.msp_status = QtWidgets.QLabel('Betaflight MSP attitude · no recording loaded')
+        self.msp_status.setStyleSheet('color:#9bb0c8; padding:3px')
+        msp_layout.addWidget(self.msp_status)
+        self.msp_plots = []
+        for axis in ('Roll', 'Pitch', 'Yaw'):
+            plot = pg.PlotWidget(title=f'MSP {axis} attitude')
+            plot.setLabel('left', 'Angle', units='deg')
+            plot.getAxis('left').setWidth(76)
+            plot.setLabel('bottom', 'Simulation time', units='s')
+            plot.showGrid(x=True, y=True, alpha=.15)
+            plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+            msp_layout.addWidget(plot)
+            self.msp_plots.append(plot)
+        for plot in self.msp_plots[1:]:
+            plot.setXLink(self.msp_plots[0])
         velocity_layout = QtWidgets.QVBoxLayout(self.velocity_tab)
         velocity_layout.setContentsMargins(12, 12, 12, 12)
         self.velocity_plots = []
@@ -637,7 +658,7 @@ class Overview(QtWidgets.QMainWindow):
             self.cards[title].setText(title + '\n' + value)
         y_range = '' if summary.y_range_m is None else f' · World Y range {summary.y_range_m[0]:+.2f}…{summary.y_range_m[1]:+.2f} m'
         self.notices.setText(episode.trajectory_origin + y_range + '\n' + ' '.join((*self.data.notices, *episode.notices)))
-        for plot in (self.trajectory, self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.velocity_plots):
+        for plot in (self.trajectory, self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.velocity_plots):
             plot.clear()
         tx, x = episode.trajectory.plot(0)
         _, z = episode.trajectory.plot(2)
@@ -657,6 +678,17 @@ class Overview(QtWidgets.QMainWindow):
         for column, (plot, name) in enumerate(zip(self.attitude_plots, ('Roll', 'Pitch', 'Yaw'))):
             self._curve(plot, episode.attitude, column, 'Measured ' + name, ATTITUDE_MEASURED_COLOR)
             self._curve(plot, episode.feedback_attitude, column, 'Estimated ' + name, ATTITUDE_ESTIMATED_COLOR, dashed=True)
+        has_msp = bool(len(episode.msp_attitude.times))
+        self.msp_status.setText('Betaflight MSP attitude · measured at the firmware response timestamps'
+                                if has_msp else 'Betaflight MSP attitude unavailable in this recording')
+        for column, (plot, name) in enumerate(zip(self.msp_plots, ('Roll', 'Pitch', 'Yaw'))):
+            if has_msp:
+                self._curve(plot, episode.msp_attitude, column, 'MSP measured ' + name, MSP_MEASURED_COLOR)
+                self._curve(plot, episode.msp_attitude_estimate, column, 'Kalman estimate ' + name,
+                            MSP_ESTIMATED_COLOR, dashed=True)
+            self._curve(plot, episode.attitude, column, 'Physical reference ' + name, ATTITUDE_MEASURED_COLOR)
+            self._curve(plot, episode.feedback_attitude, column, 'Controller feedback ' + name,
+                        ATTITUDE_ESTIMATED_COLOR, dashed=True)
         self._curve(self.thrust_plot, episode.thrust, 0, 'Commanded thrust', COLORS[3])
         for column, (plot, axis) in enumerate(zip(self.velocity_plots, ('X', 'Y', 'Z'))):
             self._curve(plot, episode.velocity, column, 'Ground truth ' + axis, COLORS[column])
@@ -666,13 +698,13 @@ class Overview(QtWidgets.QMainWindow):
             episode.velocity.times, np.hypot(episode.velocity.values[:, 0], episode.velocity.values[:, 2])))
         self._curve(self.velocity_plots[3], slant_velocity, 0, 'Ground truth X–Z speed', COLORS[3])
         if episode.tracking_time_s is not None:
-            for plot in (*self.attitude_plots, self.thrust_plot):
+            for plot in (*self.attitude_plots, *self.msp_plots, self.thrust_plot):
                 plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,
                                               pen=pg.mkPen('#ffb454', width=2, style=QtCore.Qt.PenStyle.DashLine),
                                               label='Tracking starts',
                                               labelOpts={'color': '#ffb454', 'position': .9}))
         self.cursors = []
-        for plot in (self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.velocity_plots):
+        for plot in (self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.msp_plots, *self.velocity_plots):
             line = pg.InfiniteLine(0, angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
             plot.addItem(line)
             line.sigPositionChanged.connect(lambda line=line: self.set_cursor(line.value()))
@@ -681,6 +713,8 @@ class Overview(QtWidgets.QMainWindow):
         self.altitude.enableAutoRange()
         self.margins.enableAutoRange(axis='y')
         for plot in self.attitude_plots:
+            plot.enableAutoRange()
+        for plot in self.msp_plots:
             plot.enableAutoRange()
         self.thrust_plot.enableAutoRange()
         for plot in self.velocity_plots:

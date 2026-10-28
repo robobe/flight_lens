@@ -102,6 +102,8 @@ class Episode:
     barometer_velocity: Series
     attitude: Series
     feedback_attitude: Series
+    msp_attitude: Series
+    msp_attitude_estimate: Series
     thrust: Series
     tracking_time_s: float | None
     barometer: Series

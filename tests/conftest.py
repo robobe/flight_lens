@@ -42,6 +42,19 @@ def feedback(t, orientation=(0., 0., 0., 1.), episode='episode'):
                 state='running', reason='tracking')
 
 
+def msp(t, attitude=(0., 0., 0.), episode='episode'):
+    return dict(schema_version=1, source=source(t, round(t * 100), episode), backend='betaflight',
+                timestamp_kind='host_receipt', firmware=None, error=None,
+                msp_delivery=dict(requests_hz=50., responses_hz=50., queue_delay_mean_s=0., queue_delay_max_s=0.,
+                                  response_turnaround_mean_s=0., response_turnaround_max_s=0.),
+                sensor_feedback=dict(window_s=1., expected_hz=120., observed_hz=120., feedback_age_s=0.,
+                                     attitude_age_s=0., barometer_age_s=0., image_age_s=None,
+                                     image_attitude_offset_s=None, vision_reason=None, mission_phase='HOVER'),
+                rc_frames_sent=1, last_rc_sent_at_s=0.,
+                attitude=dict(roll_rad=attitude[0], pitch_rad=attitude[1], yaw_rad=attitude[2], received_at=0.),
+                altitude=None, status=None)
+
+
 def rc(t, throttle=1500, episode='episode'):
     sequence = round(t * 100)
     return dict(schema_version=1, physics_id='physics', episode_id=episode, app_id='app', sequence=sequence,
@@ -95,7 +108,7 @@ def write_mcap(path, records, health_data=None, frames=()):
 
 @pytest.fixture
 def flight_file(tmp_path):
-    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS,FEEDBACK,RC
+    from flight_lens.reader import TRUTH,POSE,MISSION,METADATA,BBOX,SENSORS,FEEDBACK,MSP,RC
     s=source(.1,10)
     diagnostics=dict(vision_reason='clipped_target',processed_image_stream_id='stream',
                      processed_image_sequence=42,processed_image_timestamp_s=s['measurement_us']/1e6,
@@ -108,6 +121,7 @@ def flight_file(tmp_path):
              (BBOX,.11,dict(schema_version=2,image_topic='camera/front/image',session='a'*32,sequence=42,capture_ns=s['measurement_us']*1000,source=s,bbox=dict(x=0,y=1,width=2,height=2))),
              (TRUTH,.12,truth(.1,(1.,2.,2.),orientation=(.0871557,0.,0.,.9961947),velocity=(3.,0.,4.))),
              (FEEDBACK,.13,feedback(.1,orientation=(0.,.1736482,0.,.9848078))),
+             (MSP,.14,msp(.1,(.1,.2,.3))), (MSP,.15,msp(.12,(.12,.22,.32))),
              (RC,.14,rc(.2,throttle=1500)), (SENSORS,.15,sensors),
              (MISSION,.14,mission(.1,'YAW_SETTLE','settling',diagnostics)),
              (MISSION,.2,mission(.2,'YAW_SETTLE','settling',diagnostics)),
