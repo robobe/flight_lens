@@ -14,12 +14,16 @@ dependencies = [
     "foxglove-schemas-protobuf>=0.3,<0.4",
     "jsonschema>=4,<5",
     "numpy>=2,<3",
+    "pyyaml>=6,<7",
     "pyside6-essentials>=6.8,<7",
     "pyqtgraph>=0.13.7,<0.15",
 ]
 
 [project.scripts]
 flight-lens = "flight_lens.app:main"
+
+[project.optional-dependencies]
+assistant = ["llama-cpp-python>=0.3,<1"]
 
 [dependency-groups]
 dev = ["pytest>=9,<10"]

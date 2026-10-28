@@ -141,6 +141,28 @@ time; audio and other overlays are not included.
 uv run --locked --all-packages --all-extras --all-groups pytest -q
 ```
 
+The default `config/flight_lens.yaml` points the optional local assistant at the
+configured GGUF model. Override the settings file or model path when needed:
+
+```bash
+uv run --locked --extra assistant --package flight-lens flight-lens \
+  --config config/flight_lens.yaml
+
+uv run --locked --extra assistant --package flight-lens flight-lens \
+  --assistant-model /path/to/model.gguf
+```
+
+For NVIDIA CUDA offloading, install the CUDA-enabled llama.cpp backend before
+launching FlightLens:
+
+```bash
+CMAKE_ARGS="-DGGML_CUDA=on" uv pip install --python .venv/bin/python \
+  --reinstall --no-cache-dir llama-cpp-python
+```
+
+FlightLens requests all model layers on the GPU (`n_gpu_layers=-1`). A CPU-only
+build remains usable but will not provide CUDA acceleration.
+
 Qt tests use its offscreen platform. Real-display checks additionally exercise
 large recordings, rendering, event selection and exact image preview. See
 [the saved v1 plan](docs/plan-v1.md) for verification outcomes.

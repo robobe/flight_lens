@@ -10,14 +10,19 @@ from threading import Event as CancelEvent
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
+import yaml
 
 from .reader import Cancelled, load_flight, read_frame
 from .model import series
 from .video import export_mp4
+from .assistant import LlamaCppBackend, McapAssistant
 
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
+ATTITUDE_MEASURED_COLOR = '#58b8f5'
+ATTITUDE_ESTIMATED_COLOR = '#ff8282'
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
+DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
 
 
 def plain(value):
@@ -26,6 +31,24 @@ def plain(value):
     if isinstance(value, tuple):
         return [plain(v) for v in value]
     return value
+
+
+def load_config(path):
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text())
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise ValueError(f'invalid FlightLens config: {path}') from error
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError('FlightLens config must be a YAML mapping')
+    model = data.get('assistant-model', '')
+    if model is not None and not isinstance(model, str):
+        raise ValueError('assistant-model must be a string')
+    return {'assistant_model': model or None}
 
 
 class Task(QtCore.QThread):
@@ -116,12 +139,15 @@ class ExportDialog(QtWidgets.QDialog):
 
 
 class Overview(QtWidgets.QMainWindow):
-    def __init__(self):
+    def __init__(self, assistant_model=None):
         super().__init__()
+        self.assistant_model = assistant_model
+        self.assistant = None if assistant_model is None else McapAssistant(LlamaCppBackend(assistant_model))
         self.data = self.episode = None
         self.jobs = set()
         self.serial = self.load_token = self.preview_token = 0
         self.export_token = -1
+        self.assistant_token = -1
         self.closing = False
         self.frame_cache = OrderedDict()
         self.last_error = ''
@@ -180,6 +206,8 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.controls, 'Attitude & Thrust')
         self.velocity_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.velocity_tab, 'Velocity')
+        self.assistant_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.assistant_tab, 'Assistant')
         outer.addWidget(self.tabs)
         layout = QtWidgets.QVBoxLayout(self.content)
         cards = QtWidgets.QHBoxLayout()
@@ -273,17 +301,26 @@ class Overview(QtWidgets.QMainWindow):
         self.setCentralWidget(root)
         controls_layout = QtWidgets.QVBoxLayout(self.controls)
         controls_layout.setContentsMargins(12, 12, 12, 12)
-        self.attitude_plot = pg.PlotWidget(title='Attitude · actual and controller feedback')
-        self.attitude_plot.setLabel('left', 'Angle', units='deg')
-        self.thrust_plot = pg.PlotWidget(title='Commanded collective thrust')
-        self.thrust_plot.setLabel('left', 'Commanded thrust', units='%')
-        for plot in (self.attitude_plot, self.thrust_plot):
+        self.attitude_plots = []
+        for axis in ('Roll', 'Pitch', 'Yaw'):
+            plot = pg.PlotWidget(title=f'{axis} attitude · measured and estimated')
+            plot.setLabel('left', 'Angle', units='deg')
             plot.getAxis('left').setWidth(76)
             plot.setLabel('bottom', 'Simulation time', units='s')
             plot.showGrid(x=True, y=True, alpha=.15)
             plot.addLegend(offset=(10, 5), labelTextSize='10pt')
             controls_layout.addWidget(plot)
-        self.thrust_plot.setXLink(self.attitude_plot)
+            self.attitude_plots.append(plot)
+        self.thrust_plot = pg.PlotWidget(title='Commanded collective thrust')
+        self.thrust_plot.setLabel('left', 'Commanded thrust', units='%')
+        for plot in (self.thrust_plot,):
+            plot.getAxis('left').setWidth(76)
+            plot.setLabel('bottom', 'Simulation time', units='s')
+            plot.showGrid(x=True, y=True, alpha=.15)
+            plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+            controls_layout.addWidget(plot)
+        for plot in self.attitude_plots[1:] + [self.thrust_plot]:
+            plot.setXLink(self.attitude_plots[0])
         velocity_layout = QtWidgets.QVBoxLayout(self.velocity_tab)
         velocity_layout.setContentsMargins(12, 12, 12, 12)
         self.velocity_plots = []
@@ -306,8 +343,109 @@ class Overview(QtWidgets.QMainWindow):
         self.velocity_plots.append(slant_plot)
         for plot in self.velocity_plots[1:]:
             plot.setXLink(self.velocity_plots[0])
+        self._build_assistant()
         self.cursors = []
         self.selected_position = None
+
+    def _build_assistant(self):
+        layout = QtWidgets.QVBoxLayout(self.assistant_tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        left = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left)
+        left_layout.addWidget(QtWidgets.QLabel('LOCAL FLIGHT ASSISTANT'))
+        self.assistant_status = QtWidgets.QLabel(
+            'Configure --assistant-model with a GGUF file to enable this tab.'
+            if self.assistant is None else 'Ready when an MCAP is loaded.')
+        self.assistant_status.setWordWrap(True)
+        self.assistant_status.setStyleSheet('color:#9bb0c8; padding:3px')
+        left_layout.addWidget(self.assistant_status)
+        examples = QtWidgets.QComboBox()
+        examples.addItems((
+            'Summarize this flight.',
+            'What happened at the first fault?',
+            'Plot altitude and vertical speed around the first fault.',
+            'Plot X, Z, and slant velocity during target search.',
+            'Compare actual and estimated attitude.',
+        ))
+        use_example = QtWidgets.QPushButton('Use example prompt')
+        use_example.clicked.connect(lambda: self.assistant_prompt.setText(examples.currentText()))
+        left_layout.addWidget(examples)
+        left_layout.addWidget(use_example)
+        self.assistant_transcript = QtWidgets.QPlainTextEdit()
+        self.assistant_transcript.setReadOnly(True)
+        self.assistant_transcript.setPlaceholderText('Assistant answers will appear here.')
+        left_layout.addWidget(self.assistant_transcript, 1)
+        self.assistant_prompt = QtWidgets.QLineEdit()
+        self.assistant_prompt.setPlaceholderText('Ask about the selected episode…')
+        self.assistant_prompt.returnPressed.connect(self.ask_assistant)
+        left_layout.addWidget(self.assistant_prompt)
+        controls = QtWidgets.QHBoxLayout()
+        self.assistant_graph = QtWidgets.QCheckBox('Show result as graph')
+        self.assistant_graph.setChecked(True)
+        controls.addWidget(self.assistant_graph)
+        self.assistant_submit = QtWidgets.QPushButton('Ask')
+        self.assistant_submit.clicked.connect(self.ask_assistant)
+        controls.addWidget(self.assistant_submit)
+        self.assistant_cancel = QtWidgets.QPushButton('Cancel')
+        self.assistant_cancel.clicked.connect(self.cancel_assistant)
+        self.assistant_cancel.hide()
+        controls.addWidget(self.assistant_cancel)
+        left_layout.addLayout(controls)
+        split.addWidget(left)
+        self.assistant_plot = pg.PlotWidget(title='Assistant chart result')
+        self.assistant_plot.setLabel('bottom', 'Simulation time', units='s')
+        self.assistant_plot.setLabel('left', 'Value')
+        self.assistant_plot.showGrid(x=True, y=True, alpha=.15)
+        self.assistant_plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+        split.addWidget(self.assistant_plot)
+        split.setSizes([620, 760])
+        layout.addWidget(split, 1)
+        enabled = self.assistant is not None
+        self.assistant_prompt.setEnabled(enabled)
+        self.assistant_submit.setEnabled(enabled)
+        self.assistant_graph.setEnabled(enabled)
+
+    def ask_assistant(self):
+        if self.assistant is None or self.data is None or self.episode is None:
+            self.assistant_status.setText('Load an MCAP and configure --assistant-model first.')
+            return
+        if any(job.kind == 'assistant' for job in self.jobs):
+            return
+        prompt = self.assistant_prompt.text().strip()
+        if not prompt:
+            self.assistant_status.setText('Enter a question or choose an example prompt.')
+            return
+        data, episode = self.data, self.episode
+        job = self._task('assistant', lambda progress, cancel: self.assistant.answer(
+            data, episode, prompt, cancel=cancel, progress=progress))
+        self.assistant_token = job.token
+        self.assistant_submit.setEnabled(False)
+        self.assistant_cancel.show()
+        self.assistant_status.setText('Analyzing selected MCAP data…')
+        self._append_assistant('You', prompt)
+        job.start()
+
+    def cancel_assistant(self):
+        for job in self.jobs:
+            if job.kind == 'assistant':
+                job.cancelled.set()
+        self.assistant_status.setText('Cancelling assistant…')
+
+    def _append_assistant(self, speaker, text):
+        self.assistant_transcript.appendPlainText(f'{speaker}: {text}')
+
+    def _show_assistant_chart(self, chart):
+        self.assistant_plot.clear()
+        if not chart or not self.assistant_graph.isChecked():
+            return
+        self.assistant_plot.setTitle(chart['title'])
+        self.assistant_plot.setLabel('bottom', chart['x_label'], units=chart['x_unit'])
+        for index, item in enumerate(chart['series']):
+            self.assistant_plot.plot(chart['x'], item['values'], pen=pg.mkPen(COLORS[index % len(COLORS)], width=2),
+                                     name=f"{item['name']} ({item['unit']})" if item['unit'] else item['name'],
+                                     connect='finite')
+        self.assistant_plot.enableAutoRange()
 
     def choose_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open flight recording', '', 'MCAP recordings (*.mcap *.partial);;All files (*)')
@@ -355,10 +493,17 @@ class Overview(QtWidgets.QMainWindow):
         self.jobs.add(job)
         job.result.connect(lambda result, job=job: self._result(job, result))
         job.failed.connect(lambda message, job=job: self._failed(job, message))
-        job.progress.connect(lambda message, job=job: self.status.setText(message)
-                             if job.token in (self.load_token, self.export_token) and not job.cancelled.is_set() else None)
+        job.progress.connect(lambda message, job=job: self._set_job_progress(job, message))
         job.finished.connect(lambda job=job: self._finished(job))
         return job
+
+    def _set_job_progress(self, job, message):
+        if job.cancelled.is_set():
+            return
+        if job.token in (self.load_token, self.export_token):
+            self.status.setText(message)
+        elif job.token == self.assistant_token:
+            self.assistant_status.setText(message)
 
     def open_file(self, path):
         for job in self.jobs:
@@ -401,6 +546,10 @@ class Overview(QtWidgets.QMainWindow):
             while len(self.frame_cache) > FRAME_CACHE_SIZE:
                 self.frame_cache.popitem(last=False)
             self.canvas.show_frame(frame, bbox)
+        elif job.kind == 'assistant' and job.token == self.assistant_token:
+            self._append_assistant('FlightLens', result.text)
+            self._show_assistant_chart(result.chart)
+            self.assistant_status.setText('Ready.')
 
     def _failed(self, job, message):
         if self.closing or job.cancelled.is_set():
@@ -418,6 +567,10 @@ class Overview(QtWidgets.QMainWindow):
         elif job.kind == 'frame' and job.token == self.preview_token:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact record could not be loaded')
             self.canvas.clear_frame('Exact frame unavailable: ' + message)
+        elif job.kind == 'assistant' and job.token == self.assistant_token:
+            if message != '':
+                self._append_assistant('FlightLens error', message)
+            self.assistant_status.setText('Assistant failed: ' + message)
 
     def _finished(self, job):
         self.jobs.discard(job)
@@ -426,6 +579,11 @@ class Overview(QtWidgets.QMainWindow):
             self.export_button.setEnabled(self.data is not None and not any(j.kind == 'load' for j in self.jobs))
             if job.token == self.export_token and job.cancelled.is_set() and not self.closing:
                 self.status.setText('MP4 export cancelled. Existing files preserved.')
+        elif job.kind == 'assistant':
+            self.assistant_cancel.hide()
+            self.assistant_submit.setEnabled(self.assistant is not None and self.data is not None)
+            if job.token == self.assistant_token and job.cancelled.is_set() and not self.closing:
+                self.assistant_status.setText('Assistant request cancelled.')
         job.deleteLater()
         if self.closing and not self.jobs:
             self.close()
@@ -448,6 +606,8 @@ class Overview(QtWidgets.QMainWindow):
             self.episodes.setCurrentIndex(data.default_episode)
         self.select_episode(data.default_episode)
         self.status.setText(f'Loaded {len(data.episodes)} episode(s) · Read-only · Images loaded only for selected events')
+        self.assistant_submit.setEnabled(self.assistant is not None and self.episode is not None)
+        self.assistant_status.setText('Ready.') if self.assistant is not None else None
 
     def _curve(self, plot, samples, column, label, color, dashed=False):
         x, y = samples.plot(column)
@@ -466,6 +626,8 @@ class Overview(QtWidgets.QMainWindow):
                 job.cancelled.set()
         self.preview_token = -1
         self.episode = episode = self.data.episodes[index]
+        if hasattr(self, 'assistant_plot'):
+            self.assistant_plot.clear()
         summary = episode.summary
         number = lambda value: 'Unavailable' if value is None else f'{value:.2f} m'
         values = {'Outcome': summary.outcome, 'Duration': f'{summary.duration_s:.2f} s',
@@ -475,7 +637,7 @@ class Overview(QtWidgets.QMainWindow):
             self.cards[title].setText(title + '\n' + value)
         y_range = '' if summary.y_range_m is None else f' · World Y range {summary.y_range_m[0]:+.2f}…{summary.y_range_m[1]:+.2f} m'
         self.notices.setText(episode.trajectory_origin + y_range + '\n' + ' '.join((*self.data.notices, *episode.notices)))
-        for plot in (self.trajectory, self.altitude, self.margins, self.attitude_plot, self.thrust_plot, *self.velocity_plots):
+        for plot in (self.trajectory, self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.velocity_plots):
             plot.clear()
         tx, x = episode.trajectory.plot(0)
         _, z = episode.trajectory.plot(2)
@@ -492,9 +654,9 @@ class Overview(QtWidgets.QMainWindow):
             self._curve(self.margins, episode.margins, column, name, COLORS[column])
         self.margins.addItem(pg.InfiniteLine(0, angle=0, pen=pg.mkPen('#ff8282', style=QtCore.Qt.PenStyle.DashLine)))
         self.margins.setTitle(episode.margins_origin + ' edge clearance · zero is boundary contact')
-        for column, name in enumerate(('Roll', 'Pitch', 'Yaw')):
-            self._curve(self.attitude_plot, episode.attitude, column, name, COLORS[column])
-            self._curve(self.attitude_plot, episode.feedback_attitude, column, 'Estimated ' + name, COLORS[column], dashed=True)
+        for column, (plot, name) in enumerate(zip(self.attitude_plots, ('Roll', 'Pitch', 'Yaw'))):
+            self._curve(plot, episode.attitude, column, 'Measured ' + name, ATTITUDE_MEASURED_COLOR)
+            self._curve(plot, episode.feedback_attitude, column, 'Estimated ' + name, ATTITUDE_ESTIMATED_COLOR, dashed=True)
         self._curve(self.thrust_plot, episode.thrust, 0, 'Commanded thrust', COLORS[3])
         for column, (plot, axis) in enumerate(zip(self.velocity_plots, ('X', 'Y', 'Z'))):
             self._curve(plot, episode.velocity, column, 'Ground truth ' + axis, COLORS[column])
@@ -504,13 +666,13 @@ class Overview(QtWidgets.QMainWindow):
             episode.velocity.times, np.hypot(episode.velocity.values[:, 0], episode.velocity.values[:, 2])))
         self._curve(self.velocity_plots[3], slant_velocity, 0, 'Ground truth X–Z speed', COLORS[3])
         if episode.tracking_time_s is not None:
-            for plot in (self.attitude_plot, self.thrust_plot):
+            for plot in (*self.attitude_plots, self.thrust_plot):
                 plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,
                                               pen=pg.mkPen('#ffb454', width=2, style=QtCore.Qt.PenStyle.DashLine),
                                               label='Tracking starts',
                                               labelOpts={'color': '#ffb454', 'position': .9}))
         self.cursors = []
-        for plot in (self.altitude, self.margins, self.attitude_plot, self.thrust_plot, *self.velocity_plots):
+        for plot in (self.altitude, self.margins, *self.attitude_plots, self.thrust_plot, *self.velocity_plots):
             line = pg.InfiniteLine(0, angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
             plot.addItem(line)
             line.sigPositionChanged.connect(lambda line=line: self.set_cursor(line.value()))
@@ -518,7 +680,8 @@ class Overview(QtWidgets.QMainWindow):
         self.trajectory.enableAutoRange()
         self.altitude.enableAutoRange()
         self.margins.enableAutoRange(axis='y')
-        self.attitude_plot.enableAutoRange()
+        for plot in self.attitude_plots:
+            plot.enableAutoRange()
         self.thrust_plot.enableAutoRange()
         for plot in self.velocity_plots:
             plot.enableAutoRange()
@@ -616,10 +779,17 @@ class Overview(QtWidgets.QMainWindow):
 def main():
     parser = argparse.ArgumentParser(description='FlightLens · read-only MCAP flight overview')
     parser.add_argument('recording', nargs='?')
+    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG_PATH,
+                        help='YAML settings file')
+    parser.add_argument('--assistant-model', help='Path to a local GGUF model for the Assistant tab')
     args = parser.parse_args()
+    try:
+        config = load_config(args.config)
+    except ValueError as error:
+        parser.error(str(error))
     application = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     application.setApplicationName('FlightLens')
-    window = Overview()
+    window = Overview(args.assistant_model or config['assistant_model'])
     window.show()
     if args.recording:
         QtCore.QTimer.singleShot(0, lambda: window.open_file(args.recording))
