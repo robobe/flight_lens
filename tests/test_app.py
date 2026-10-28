@@ -66,9 +66,11 @@ def test_overview_async_loading_cursor_event_and_frame(window,application,flight
     assert len(window.margins.plotItem.legend.items)==4
     assert len(window.attitude_plot.plotItem.legend.items)==6
     assert len(window.thrust_plot.plotItem.legend.items)==1
-    assert len(window.velocity_plots)==3
+    assert len(window.velocity_plots)==4
     assert all(len(plot.plotItem.legend.items)==1 for plot in window.velocity_plots[:2])
     assert len(window.velocity_plots[2].plotItem.legend.items)==2
+    slant_curve=next(curve for curve in window.velocity_plots[3].listDataItems() if curve.name()=='Ground truth X–Z speed')
+    np.testing.assert_allclose(slant_curve.getData()[1], [0.,5.])
 
 
 def test_invalid_file_keeps_existing_flight(window,application,flight_file,tmp_path):

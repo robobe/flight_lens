@@ -24,7 +24,7 @@ def test_truth_summary_events_and_exact_frame(flight_file):
     assert episode.margins.values.tolist()==[[0.,1.,6.,3.]]
     assert episode.attitude.values[-1,0]==pytest.approx(10., abs=.01)
     assert episode.feedback_attitude.values[-1,1]==pytest.approx(20., abs=.01)
-    assert episode.velocity.values[-1].tolist()==[0.,0.,0.]
+    assert episode.velocity.values[-1].tolist()==[3.,0.,4.]
     assert len(episode.barometer_velocity.times)==0
     assert episode.thrust.values[:,0].tolist()==[50.]
     assert episode.tracking_time_s==pytest.approx(.3)

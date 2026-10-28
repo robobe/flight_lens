@@ -12,6 +12,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
 from .reader import Cancelled, load_flight, read_frame
+from .model import series
 from .video import export_mp4
 
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
@@ -295,8 +296,16 @@ class Overview(QtWidgets.QMainWindow):
             plot.addLegend(offset=(10, 5), labelTextSize='10pt')
             velocity_layout.addWidget(plot)
             self.velocity_plots.append(plot)
-        self.velocity_plots[1].setXLink(self.velocity_plots[0])
-        self.velocity_plots[2].setXLink(self.velocity_plots[0])
+        slant_plot = pg.PlotWidget(title='X–Z slant velocity · ground truth')
+        slant_plot.setLabel('left', 'Velocity', units='m/s')
+        slant_plot.setLabel('bottom', 'Simulation time', units='s')
+        slant_plot.getAxis('left').setWidth(76)
+        slant_plot.showGrid(x=True, y=True, alpha=.15)
+        slant_plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+        velocity_layout.addWidget(slant_plot)
+        self.velocity_plots.append(slant_plot)
+        for plot in self.velocity_plots[1:]:
+            plot.setXLink(self.velocity_plots[0])
         self.cursors = []
         self.selected_position = None
 
@@ -491,6 +500,9 @@ class Overview(QtWidgets.QMainWindow):
             self._curve(plot, episode.velocity, column, 'Ground truth ' + axis, COLORS[column])
             if axis == 'Z':
                 self._curve(plot, episode.barometer_velocity, 0, 'Barometer-derived Z', COLORS[3], dashed=True)
+        slant_velocity = series((time_s, (speed,)) for time_s, speed in zip(
+            episode.velocity.times, np.hypot(episode.velocity.values[:, 0], episode.velocity.values[:, 2])))
+        self._curve(self.velocity_plots[3], slant_velocity, 0, 'Ground truth X–Z speed', COLORS[3])
         if episode.tracking_time_s is not None:
             for plot in (self.attitude_plot, self.thrust_plot):
                 plot.addItem(pg.InfiniteLine(episode.tracking_time_s, angle=90,

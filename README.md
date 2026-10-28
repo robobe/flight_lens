@@ -55,6 +55,8 @@ The Velocity tab shows ground-truth X, Y and Z velocity in metres per second.
 The Z panel also shows vertical velocity derived from the recorded barometer
 altitude, using the sample timestamps. Its line is distinct from ground truth;
 it is unavailable when fewer than two altitude samples are recorded.
+The X–Z slant-velocity panel shows ground-truth travel speed in the displayed
+flight plane, calculated as `sqrt(vx² + vz²)`.
 
 Drag the white cursor in either time plot; both plots share time and horizontal
 zoom. The position circle follows that simulation time on the trajectory, and

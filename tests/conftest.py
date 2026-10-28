@@ -106,7 +106,7 @@ def flight_file(tmp_path):
              (MISSION,.02,mission(0.,'TAKEOFF','climbing',dict(takeoff_goal_altitude_m=3.,barometer_datum_m=1.))),
              (METADATA,.1,frame_metadata(.1,42,.1)),
              (BBOX,.11,dict(schema_version=2,image_topic='camera/front/image',session='a'*32,sequence=42,capture_ns=s['measurement_us']*1000,source=s,bbox=dict(x=0,y=1,width=2,height=2))),
-             (TRUTH,.12,truth(.1,(1.,2.,2.),orientation=(.0871557,0.,0.,.9961947))),
+             (TRUTH,.12,truth(.1,(1.,2.,2.),orientation=(.0871557,0.,0.,.9961947),velocity=(3.,0.,4.))),
              (FEEDBACK,.13,feedback(.1,orientation=(0.,.1736482,0.,.9848078))),
              (RC,.14,rc(.2,throttle=1500)), (SENSORS,.15,sensors),
              (MISSION,.14,mission(.1,'YAW_SETTLE','settling',diagnostics)),
