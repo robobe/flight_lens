@@ -1,5 +1,6 @@
 """One desktop overview backed by immutable, independently testable flight data."""
 import argparse
+import csv
 from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -17,6 +18,8 @@ from .reader import Cancelled, load_flight, read_frame
 from .model import series
 from .video import export_mp4
 from .assistant import LlamaCppBackend, McapAnalysisTools, McapAssistant
+from .ttc_analysis import (TtcParameters, butterworth_filter, compare_to_hit_time,
+                           low_pass_filter, recalculate)
 
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
 ATTITUDE_MEASURED_COLOR = '#58b8f5'
@@ -26,6 +29,7 @@ MSP_ESTIMATED_COLOR = '#c299f0'
 VISUAL_RAW_COLOR = '#eab85a'
 VISUAL_FILTERED_COLOR = '#70d6ad'
 TTC_DISPLAY_PERCENTILE = 95.
+TTC_Y_AXIS_RANGES_S = (10., 20., 30.)
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
 TRACKING_TIMER_INTERVAL_MS = 30
@@ -234,6 +238,7 @@ class ErdDialog(QtWidgets.QDialog):
 class TrackingReplay(QtWidgets.QWidget):
     SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
     issue_selected = QtCore.Signal(object)
+    frame_requested = QtCore.Signal(object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,12 +270,17 @@ class TrackingReplay(QtWidgets.QWidget):
         self.next_issue.setToolTip('Jump to the next warning or error')
         self.next_issue.clicked.connect(lambda: self.jump_issue(1))
         self.issue_count = QtWidgets.QLabel('Issues: 0')
+        self.show_camera_frame = QtWidgets.QCheckBox('Show recorded image')
+        self.show_camera_frame.setChecked(True)
+        self.show_camera_frame.setToolTip('Use the exact recorded MCAP image in the camera view')
+        self.show_camera_frame.toggled.connect(self._toggle_camera_frame)
         self.speed = QtWidgets.QComboBox()
         for value in self.SPEEDS:
             self.speed.addItem(f'{value:g}×', value)
         for widget in (self.previous, self.next, self.play, self.reset, self.previous_issue, self.next_issue):
             controls.addWidget(widget)
         controls.addWidget(self.issue_count)
+        controls.addWidget(self.show_camera_frame)
         controls.addWidget(QtWidgets.QLabel('Simulation rate'))
         controls.addWidget(self.speed)
         controls.addStretch(1)
@@ -305,7 +315,13 @@ class TrackingReplay(QtWidgets.QWidget):
         self.camera_view = QtWidgets.QGraphicsView(self.camera_scene)
         self.camera_view.setMinimumSize(520, 390)
         self.camera_view.setBackgroundBrush(QtGui.QColor('#101c2a'))
-        camera_layout.addWidget(self.camera_view, 1)
+        self.camera_image = FrameCanvas()
+        self.camera_image.setMinimumSize(520, 390)
+        self.camera_image.clear_frame('Recorded image will appear when a timeline frame is available.')
+        self.camera_stack = QtWidgets.QStackedWidget()
+        self.camera_stack.addWidget(self.camera_image)
+        self.camera_stack.addWidget(self.camera_view)
+        camera_layout.addWidget(self.camera_stack, 1)
         body.addWidget(camera_panel)
         self.ball_scene = QtWidgets.QGraphicsScene(self)
         self.ball_view = QtWidgets.QGraphicsView(self.ball_scene)
@@ -315,10 +331,6 @@ class TrackingReplay(QtWidgets.QWidget):
         ball_layout = QtWidgets.QVBoxLayout(ball_panel)
         ball_layout.setContentsMargins(0, 0, 0, 0)
         ball_layout.addWidget(self.ball_view, 1)
-        self.issue_frame = FrameCanvas()
-        self.issue_frame.setMinimumSize(220, 150)
-        self.issue_frame.setMaximumHeight(190)
-        ball_layout.addWidget(self.issue_frame)
         body.addWidget(ball_panel)
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
@@ -357,7 +369,10 @@ class TrackingReplay(QtWidgets.QWidget):
         issue_layout.addWidget(self.issue_explanation)
         panel_layout.addWidget(issue_group)
         body.addWidget(panel)
-        body.setSizes([650, 390, 560])
+        body.setStretchFactor(0, 1)
+        body.setStretchFactor(1, 1)
+        body.setStretchFactor(2, 1)
+        body.setSizes([560, 560, 560])
         root.addWidget(body, 1)
         self.setEnabled(False)
 
@@ -391,7 +406,7 @@ class TrackingReplay(QtWidgets.QWidget):
         self.next_issue.setEnabled(bool(self.issue_times))
         self.issue_count.setText(f'Issues: {len(self.issue_events)}')
         self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
-        self.issue_frame.clear_frame('Select an issue to load its recorded camera frame.')
+        self.camera_image.clear_frame('Move the timeline to load the matching recorded camera frame.')
         self._render()
 
     def reset_replay(self):
@@ -404,7 +419,7 @@ class TrackingReplay(QtWidgets.QWidget):
         self.issue_index = -1
         self.issue_count.setText(f'Issues: {len(self.issue_events)}')
         self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
-        self.issue_frame.clear_frame('Select an issue to load its recorded camera frame.')
+        self.camera_image.clear_frame('Move the timeline to load the matching recorded camera frame.')
         self._render()
 
     def step(self, delta):
@@ -428,7 +443,13 @@ class TrackingReplay(QtWidgets.QWidget):
         self._render()
 
     def show_frame(self, frame, bbox):
-        self.issue_frame.show_frame(frame, bbox)
+        self.camera_image.show_frame(frame, bbox)
+
+    def clear_timeline_frame(self, text):
+        self.camera_image.clear_frame(text)
+
+    def _toggle_camera_frame(self, enabled):
+        self.camera_stack.setCurrentIndex(0 if enabled else 1)
 
     @staticmethod
     def _explain_issue(event):
@@ -539,6 +560,10 @@ class TrackingReplay(QtWidgets.QWidget):
                 value.setStyleSheet('font:11px monospace; color:#d9e6f4')
             return
         sample = self.samples[self.index]
+        if sample.frame is not None:
+            self.frame_requested.emit(sample.frame, sample.bbox)
+        else:
+            self.clear_timeline_frame('No recorded camera frame is linked to this tracking sample.')
         width, height = 640., 480.
         self.camera_scene.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor('#58b8f5'), 3))
         center_pen = QtGui.QPen(QtGui.QColor('#70d6ad'), 2)
@@ -624,6 +649,374 @@ class TrackingReplay(QtWidgets.QWidget):
         self.ball_view.fitInView(self.ball_scene.sceneRect().adjusted(-10, -10, 10, 10), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
 
 
+class TtcInvestigation(QtWidgets.QWidget):
+    """Interactive, read-only replay of the optical TTC estimator."""
+    cursor_changed = QtCore.Signal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.episode = None
+        self.parameters = TtcParameters()
+        self._oracle_max_ttc = 1.
+        self._last_export_rows = []
+        self._cursor_lines = []
+        root = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QGroupBox('TTC estimator parameters · changes are session-only')
+        form = QtWidgets.QFormLayout(controls)
+        self.fields = {}
+        descriptions = {
+            'window_s': ('Recent bbox history used by the fit.', 'Recent bbox-size history used for the reciprocal-size fit.'),
+            'min_span_s': ('History duration required before fitting.', 'Minimum elapsed history required before fitting TTC.'),
+            'min_growth_px': ('Required apparent target growth.', 'Minimum increase in apparent bbox size required to call the target closing.'),
+            'max_relative_residual': ('Reject fits above this error.', 'Maximum normalized fit error accepted as a qualified estimate.'),
+            'max_image_age_s': ('Reject stale bbox measurements.', 'Maximum bbox age accepted by the replay before resetting history.'),
+            'min_samples': ('Samples required for a fit.', 'Minimum number of bbox samples required for a fit.'),
+        }
+
+        def described_control(widget, description):
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(widget)
+            note = QtWidgets.QLabel(description)
+            note.setStyleSheet('color:#9bb0c8; font-size:11px;')
+            row.addWidget(note, 1)
+            return row
+
+        for key, label, minimum, maximum, step, decimals in (
+            ('window_s', 'History window (s)', .05, 10., .05, 2),
+            ('min_span_s', 'Minimum span (s)', .01, 10., .05, 2),
+            ('min_growth_px', 'Minimum size growth (px)', .01, 100., .1, 2),
+            ('max_relative_residual', 'Maximum fit residual', .001, 10., .01, 3),
+            ('max_image_age_s', 'Maximum image age (s)', .001, 10., .01, 3),
+        ):
+            widget = QtWidgets.QDoubleSpinBox()
+            widget.setRange(minimum, maximum)
+            widget.setSingleStep(step)
+            widget.setDecimals(decimals)
+            widget.setValue(getattr(self.parameters, key))
+            widget.setFixedWidth(88)
+            self.fields[key] = widget
+            form.addRow(label, described_control(widget, descriptions[key][0]))
+        self.fields['min_samples'] = QtWidgets.QSpinBox()
+        self.fields['min_samples'].setRange(2, 256)
+        self.fields['min_samples'].setValue(self.parameters.min_samples)
+        self.fields['min_samples'].setFixedWidth(88)
+        form.addRow('Minimum samples', described_control(self.fields['min_samples'], descriptions['min_samples'][0]))
+        self.butterworth_enabled = QtWidgets.QCheckBox('Show Butterworth-filtered estimate')
+        self.butterworth_enabled.setChecked(True)
+        self.butterworth_enabled.toggled.connect(lambda _checked: self.recalculate())
+        self.butterworth_cutoff = QtWidgets.QDoubleSpinBox()
+        self.butterworth_cutoff.setRange(.01, 20.)
+        self.butterworth_cutoff.setSingleStep(.1)
+        self.butterworth_cutoff.setDecimals(2)
+        self.butterworth_cutoff.setValue(1.)
+        self.butterworth_cutoff.setSuffix(' Hz')
+        self.butterworth_cutoff.setFixedWidth(88)
+        self.low_pass_enabled = QtWidgets.QCheckBox('Show low-pass estimate')
+        self.low_pass_enabled.setChecked(False)
+        self.low_pass_enabled.toggled.connect(lambda _checked: self.recalculate())
+        self.low_pass_alpha = QtWidgets.QDoubleSpinBox()
+        self.low_pass_alpha.setRange(.01, 1.)
+        self.low_pass_alpha.setSingleStep(.05)
+        self.low_pass_alpha.setDecimals(2)
+        self.low_pass_alpha.setValue(.25)
+        self.low_pass_alpha.setFixedWidth(70)
+        filter_row = QtWidgets.QHBoxLayout()
+        filter_row.addWidget(self.butterworth_enabled)
+        filter_row.addWidget(QtWidgets.QLabel('Hz'))
+        filter_row.addWidget(self.butterworth_cutoff)
+        filter_row.addWidget(QtWidgets.QLabel('cutoff'))
+        filter_row.addSpacing(12)
+        filter_row.addWidget(self.low_pass_enabled)
+        filter_row.addWidget(QtWidgets.QLabel('α'))
+        filter_row.addWidget(self.low_pass_alpha)
+        filter_row.addWidget(QtWidgets.QLabel('smoothing'))
+        filter_row.addStretch(1)
+        self.y_axis_range = QtWidgets.QComboBox()
+        for value in TTC_Y_AXIS_RANGES_S:
+            self.y_axis_range.addItem(f'{value:g} s', value)
+        self.y_axis_range.setFixedWidth(78)
+        self.y_axis_range.setCurrentIndex(0)
+        self.y_axis_range.currentIndexChanged.connect(lambda _index: self._apply_view())
+        self.reset_view_button = QtWidgets.QPushButton('Reset view to tracking start')
+        self.reset_view_button.clicked.connect(self._apply_view)
+        self.recalculate_button = QtWidgets.QPushButton('Recalculate from episode start')
+        self.recalculate_button.clicked.connect(self.recalculate)
+        self.export_button = QtWidgets.QPushButton('Export TTC CSV')
+        self.export_button.clicked.connect(self._export_csv)
+        self.more_button = QtWidgets.QToolButton()
+        self.more_button.setText('…')
+        self.more_button.setToolTip('Explain TTC parameters and filter overlays')
+        self.more_button.clicked.connect(self._show_parameter_help)
+        root.addWidget(controls)
+        filters = QtWidgets.QGroupBox('Filter overlays')
+        filters_layout = QtWidgets.QHBoxLayout(filters)
+        filters_layout.setContentsMargins(8, 6, 8, 6)
+        filters_layout.addLayout(filter_row)
+        root.addWidget(filters)
+        actions = QtWidgets.QGroupBox('Graph actions')
+        actions_layout = QtWidgets.QHBoxLayout(actions)
+        actions_layout.setContentsMargins(8, 6, 8, 6)
+        actions_layout.addWidget(self.recalculate_button)
+        actions_layout.addWidget(self.export_button)
+        actions_layout.addWidget(QtWidgets.QLabel('Y-axis range'))
+        actions_layout.addWidget(self.y_axis_range)
+        actions_layout.addWidget(self.reset_view_button)
+        actions_layout.addWidget(self.more_button)
+        actions_layout.addStretch(1)
+        root.addWidget(actions)
+        self.status = QtWidgets.QLabel('Select an episode to begin TTC analysis.')
+        self.status.setStyleSheet('color:#9bb0c8; padding:3px')
+        root.addWidget(self.status)
+        self.raw_plot = self._plot('Recorded TTC · raw and filtered', 'TTC', 's')
+        self.estimate_plot = self._plot('Recalculated TTC estimate · qualified values only', 'TTC', 's')
+        self.error_plot = self._plot('TTC estimate vs hit-time ground truth', 'Estimated TTC', 's')
+        self.error_plot.setLabel('bottom', 'Ground-truth TTC to hit', units='s')
+        self.raw_plot.setXLink(self.estimate_plot)
+        self.estimate_plot.setXLink(self.raw_plot)
+        root.addWidget(self.raw_plot, 1)
+        root.addWidget(self.estimate_plot, 1)
+        root.addWidget(self.error_plot, 1)
+
+        for key, description in descriptions.items():
+            self.fields[key].setToolTip(description[1])
+        self.butterworth_cutoff.setToolTip('Offline second-order Butterworth low-pass cutoff for the estimate overlay.')
+        self.low_pass_alpha.setToolTip('Causal exponential low-pass alpha in (0, 1]. Higher values follow the estimate more closely.')
+
+    def _show_parameter_help(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle('TTC parameter guide')
+        dialog.resize(620, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        text = QtWidgets.QLabel(
+            '<b>Production estimate</b><br>'
+            'TTC is fitted from reciprocal apparent bbox size. Invalid samples remain gaps and reset boundaries are preserved.<br><br>'
+            '<b>History window</b> controls how much recent bbox motion is fitted.<br>'
+            '<b>Minimum span / samples</b> prevent estimates from starting too early.<br>'
+            '<b>Minimum growth</b> requires measurable target expansion.<br>'
+            '<b>Maximum residual</b> rejects noisy reciprocal-size fits.<br>'
+            '<b>Maximum image age</b> rejects stale detections.<br><br>'
+            '<b>Butterworth overlay</b> is an offline, zero-phase, second-order low-pass view of qualified estimates.<br>'
+            '<b>Low-pass overlay</b> is a causal exponential filter; alpha 1 follows the estimate and smaller alpha values smooth more. '
+            'It does not change the recorded flight control values.<br><br>'
+            '<b>Hit-time oracle</b> is retrospective: it uses target-hit time minus sample time. '
+            'It is available only for episodes that recorded target_hit and is never used by the controller.'
+        )
+        text.setWordWrap(True)
+        text.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        layout.addWidget(text)
+        close = QtWidgets.QPushButton('Close')
+        close.clicked.connect(dialog.accept)
+        layout.addWidget(close, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        dialog.exec()
+
+    def _export_csv(self):
+        if not self._last_export_rows:
+            self.status.setText('No TTC samples available to export.')
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export TTC CSV', 'ttc-analysis.csv', 'CSV files (*.csv)')
+        if not path:
+            return
+        columns = tuple(self._last_export_rows[0])
+        try:
+            with open(path, 'w', newline='', encoding='utf-8') as output:
+                writer = csv.DictWriter(output, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(self._last_export_rows)
+        except OSError as error:
+            self.status.setText('TTC CSV export failed: ' + str(error))
+            return
+        self.status.setText(f'Exported TTC CSV: {path}')
+
+    @staticmethod
+    def _plot(title, label, unit):
+        plot = pg.PlotWidget(title=title)
+        plot.setLabel('left', label, units=unit)
+        plot.setLabel('bottom', 'Simulation time', units='s')
+        plot.getAxis('left').setWidth(76)
+        plot.showGrid(x=True, y=True, alpha=.15)
+        plot.addLegend(offset=(10, 5), labelTextSize='10pt')
+        return plot
+
+    def set_episode(self, episode):
+        self.episode = episode
+        self.recalculate()
+
+    def set_cursor(self, time_s):
+        for line in self._cursor_lines:
+            with QtCore.QSignalBlocker(line):
+                line.setValue(time_s)
+
+    def _parameters_from_controls(self):
+        return TtcParameters(**{name: widget.value() for name, widget in self.fields.items()})
+
+    def _tracking_bounds(self):
+        if self.episode is None or not self.episode.tracking_samples:
+            return 0., 1.
+        start = self.episode.tracking_time_s
+        start = self.episode.tracking_samples[0].time_s if start is None else start
+        end = self.episode.tracking_samples[-1].time_s
+        terminal = [event.time_s for event in self.episode.events
+                    if event.time_s is not None and event.time_s >= start
+                    and event.phase in ('LOS_COMMIT', 'FAULT')]
+        if terminal:
+            end = min(end, min(terminal))
+        return float(start), max(float(start), float(end))
+
+    def _apply_view(self):
+        if self.episode is None:
+            return
+        start, end = self._tracking_bounds()
+        y_max = float(self.y_axis_range.currentData() or TTC_Y_AXIS_RANGES_S[0])
+        for plot in (self.raw_plot, self.estimate_plot):
+            plot.setLimits(xMin=start, xMax=end, yMin=0., yMax=y_max)
+            plot.setXRange(start, end, padding=0.)
+            plot.setYRange(0., y_max, padding=0.)
+        oracle_max = max(y_max, self._oracle_max_ttc)
+        self.error_plot.setLimits(xMin=0., xMax=oracle_max, yMin=0., yMax=y_max)
+        self.error_plot.setXRange(oracle_max, 0., padding=0.)
+        self.error_plot.setYRange(0., y_max, padding=0.)
+        self.error_plot.setYRange(-y_max, y_max, padding=0.)
+
+    def recalculate(self):
+        if self.episode is None:
+            return
+        try:
+            parameters = self._parameters_from_controls().validate()
+            result = recalculate(self.episode.tracking_samples, parameters)
+        except ValueError as error:
+            self.status.setText('Invalid TTC parameters: ' + str(error))
+            return
+        self.parameters = parameters
+        self._cursor_lines.clear()
+        self.raw_plot.clear()
+        self.estimate_plot.clear()
+        self.error_plot.clear()
+        tracking_start, tracking_end = self._tracking_bounds()
+        if len(self.episode.ttc_raw.times):
+            raw_mask = (self.episode.ttc_raw.times >= tracking_start) & (self.episode.ttc_raw.times <= tracking_end)
+            self.raw_plot.plot(self.episode.ttc_raw.times[raw_mask], self.episode.ttc_raw.values[raw_mask, 0],
+                               pen=pg.mkPen(VISUAL_RAW_COLOR, width=2), name='Recorded raw TTC', connect='finite')
+        if len(self.episode.ttc_filtered.times):
+            filtered_mask = (self.episode.ttc_filtered.times >= tracking_start) & (self.episode.ttc_filtered.times <= tracking_end)
+            self.raw_plot.plot(self.episode.ttc_filtered.times[filtered_mask], self.episode.ttc_filtered.values[filtered_mask, 0],
+                               pen=pg.mkPen(VISUAL_FILTERED_COLOR, width=2, style=QtCore.Qt.PenStyle.DashLine),
+                               name='Recorded filtered TTC', connect='finite')
+        points = result.points
+        comparison = compare_to_hit_time(self.episode, points)
+        self._oracle_max_ttc = max((value for _, value in comparison.oracle), default=1.)
+        raw_by_time = dict(zip(self.episode.ttc_raw.times.tolist(), self.episode.ttc_raw.values[:, 0].tolist()))
+        filtered_by_time = dict(zip(self.episode.ttc_filtered.times.tolist(), self.episode.ttc_filtered.values[:, 0].tolist()))
+        oracle_by_time = dict(comparison.oracle)
+        butter_values = butterworth_filter(points, self.butterworth_cutoff.value())
+        low_values = low_pass_filter(points, self.low_pass_alpha.value())
+        self._last_export_rows = []
+        for point, butter_value, low_value in zip(points, butter_values, low_values):
+            self._last_export_rows.append({
+                'simulation_time_s': point.time_s,
+                'recorded_raw_ttc_s': raw_by_time.get(point.time_s),
+                'recorded_filtered_ttc_s': filtered_by_time.get(point.time_s),
+                'recalculated_ttc_s': point.value_s if point.valid else None,
+                'butterworth_ttc_s': butter_value if self.butterworth_enabled.isChecked() else None,
+                'low_pass_ttc_s': low_value if self.low_pass_enabled.isChecked() else None,
+                'ground_truth_ttc_s': oracle_by_time.get(point.time_s),
+                'ttc_valid': point.valid,
+                'ttc_reason': point.reason,
+            })
+        valid = [(point.time_s, point.value_s) for point in points
+                 if point.valid and tracking_start <= point.time_s <= tracking_end]
+        if valid:
+            self.estimate_plot.plot([item[0] for item in valid], [item[1] for item in valid],
+                                    pen=pg.mkPen('#c299f0', width=2), name='Recalculated estimate', connect='finite')
+        reason_colors = {'not_closing': '#eab85a', 'unresolved_growth': '#ff8282',
+                         'insufficient_history': '#9bb0c8', 'noisy_growth': '#f28f8f',
+                         'stale': '#c299f0', 'recovery': '#ffb454', 'clipped_target': '#ff8282'}
+        for reason, color in reason_colors.items():
+            invalid = [point for point in points if not point.valid and point.reason == reason
+                       and tracking_start <= point.time_s <= tracking_end]
+            if invalid:
+                self.estimate_plot.plot([point.time_s for point in invalid], [0.] * len(invalid),
+                                        pen=None, symbol='t', symbolSize=7,
+                                        symbolBrush=color, name=reason, connect='finite')
+        if self.butterworth_enabled.isChecked() and valid:
+            filtered_values = butter_values
+            filtered_curve = [(point.time_s, value) for point, value in zip(points, filtered_values)
+                              if value is not None and tracking_start <= point.time_s <= tracking_end]
+            if filtered_curve:
+                self.estimate_plot.plot([item[0] for item in filtered_curve], [item[1] for item in filtered_curve],
+                                        pen=pg.mkPen('#70d6ad', width=2, style=QtCore.Qt.PenStyle.DashLine),
+                                        name='Butterworth estimate', connect='finite')
+        if self.low_pass_enabled.isChecked() and valid:
+            filtered_values = low_values
+            filtered_curve = [(point.time_s, value) for point, value in zip(points, filtered_values)
+                              if value is not None and tracking_start <= point.time_s <= tracking_end]
+            if filtered_curve:
+                self.estimate_plot.plot([item[0] for item in filtered_curve], [item[1] for item in filtered_curve],
+                                        pen=pg.mkPen('#58b8f5', width=2, style=QtCore.Qt.PenStyle.DashDotLine),
+                                        name='Low-pass estimate', connect='finite')
+        oracle = [(time_s, value) for time_s, value in comparison.oracle
+                  if tracking_start <= time_s <= tracking_end]
+        if oracle:
+            self.estimate_plot.plot([item[0] for item in oracle], [item[1] for item in oracle],
+                                    pen=pg.mkPen('#ffffff', width=2, style=QtCore.Qt.PenStyle.DashLine),
+                                    name='Hit-time oracle', connect='finite')
+            oracle_by_time = dict(oracle)
+            estimate_comparison = [(oracle_by_time[point.time_s], point.value_s)
+                              for point in points if point.valid and point.time_s in oracle_by_time
+                              and tracking_start <= point.time_s <= tracking_end]
+            if estimate_comparison:
+                self.error_plot.plot([item[0] for item in estimate_comparison], [item[1] for item in estimate_comparison],
+                                     pen=None, symbol='o', symbolSize=5, symbolBrush='#c299f0',
+                                     name='Estimate', connect='finite')
+            if self.butterworth_enabled.isChecked():
+                butter_values = butterworth_filter(points, self.butterworth_cutoff.value())
+                curve = [(oracle_by_time[point.time_s], value)
+                         for point, value in zip(points, butter_values)
+                         if value is not None and point.time_s in oracle_by_time
+                         and tracking_start <= point.time_s <= tracking_end]
+                if curve:
+                    self.error_plot.plot([item[0] for item in curve], [item[1] for item in curve],
+                                         pen=None, symbol='t', symbolSize=6, symbolBrush='#70d6ad',
+                                         name='Butterworth', connect='finite')
+            if self.low_pass_enabled.isChecked():
+                low_values = low_pass_filter(points, self.low_pass_alpha.value())
+                curve = [(oracle_by_time[point.time_s], value)
+                         for point, value in zip(points, low_values)
+                         if value is not None and point.time_s in oracle_by_time
+                         and tracking_start <= point.time_s <= tracking_end]
+                if curve:
+                    self.error_plot.plot([item[0] for item in curve], [item[1] for item in curve],
+                                         pen=None, symbol='s', symbolSize=6, symbolBrush='#58b8f5',
+                                         name='Low-pass', connect='finite')
+            max_ttc = max(value for _, value in oracle)
+            self.error_plot.plot([0., max_ttc], [0., max_ttc],
+                                 pen=pg.mkPen('#ffffff', width=2, style=QtCore.Qt.PenStyle.DashLine),
+                                 name='Perfect agreement y=x', connect='finite')
+        y_max = float(self.y_axis_range.currentData() or TTC_Y_AXIS_RANGES_S[0])
+        for plot in (self.raw_plot, self.estimate_plot):
+            plot.setLimits(xMin=tracking_start, xMax=tracking_end, yMin=0., yMax=y_max)
+            plot.setXRange(tracking_start, tracking_end, padding=0.)
+            plot.setYRange(0., y_max, padding=0.)
+            line = pg.InfiniteLine(tracking_start,
+                                   angle=90, movable=True, pen=pg.mkPen('#ffffff', width=1))
+            plot.addItem(line)
+            line.sigPositionChanged.connect(lambda line=line: self.cursor_changed.emit(line.value()))
+            self._cursor_lines.append(line)
+        oracle_max = max(y_max, self._oracle_max_ttc)
+        self.error_plot.setLimits(xMin=0., xMax=oracle_max, yMin=0., yMax=y_max)
+        self.error_plot.setXRange(oracle_max, 0., padding=0.)
+        self.error_plot.setYRange(0., y_max, padding=0.)
+        counts = ', '.join(f'{reason}: {count}' for reason, count in sorted(result.counts.items()))
+        metrics = ('oracle unavailable: no recorded target_hit event' if comparison.hit_time_s is None else
+                   f'oracle hit t={comparison.hit_time_s:.3f}s · MAE {comparison.mean_absolute_error_s:.3f}s · '
+                   f'RMSE {comparison.root_mean_square_error_s:.3f}s · bias {comparison.bias_s:+.3f}s · '
+                   f'coverage {comparison.coverage:.0%}') if comparison.hit_time_s is not None and comparison.sample_count else (
+                       'oracle available, but no qualified estimate overlaps it' if comparison.hit_time_s is not None else
+                       'oracle unavailable: no recorded target_hit event')
+        self.status.setText(f'Recorded points: {len(self.episode.ttc_raw.times)} raw, {len(self.episode.ttc_filtered.times)} filtered · Recalculated: {counts} · {metrics}')
+
+
 class Overview(QtWidgets.QMainWindow):
     def __init__(self, assistant_model=None):
         super().__init__()
@@ -631,7 +1024,7 @@ class Overview(QtWidgets.QMainWindow):
         self.assistant = None if assistant_model is None else McapAssistant(LlamaCppBackend(assistant_model))
         self.data = self.episode = None
         self.jobs = set()
-        self.serial = self.load_token = self.preview_token = 0
+        self.serial = self.load_token = self.preview_token = self.tracking_frame_token = 0
         self.export_token = -1
         self.assistant_token = -1
         self.assistant_generated_sql = None
@@ -696,10 +1089,14 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.msp_tab, 'MSP')
         self.visual_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.visual_tab, 'Visual')
+        self.ttc_tab = TtcInvestigation()
+        self.ttc_tab.cursor_changed.connect(self.set_cursor)
+        self.tabs.addTab(self.ttc_tab, 'TTC')
         self.velocity_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.velocity_tab, 'Velocity')
         self.tracking_tab = TrackingReplay()
         self.tracking_tab.issue_selected.connect(self._select_tracking_issue)
+        self.tracking_tab.frame_requested.connect(self._request_tracking_frame)
         self.tabs.addTab(self.tracking_tab, 'Tracking')
         self.assistant_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.assistant_tab, 'Assistant')
@@ -1213,6 +1610,13 @@ class Overview(QtWidgets.QMainWindow):
                 self.frame_cache.popitem(last=False)
             self.canvas.show_frame(frame, bbox)
             self.tracking_tab.show_frame(frame, bbox)
+        elif job.kind == 'tracking_frame' and job.token == self.tracking_frame_token:
+            reference, frame, bbox = result
+            self.frame_cache[reference] = frame
+            self.frame_cache.move_to_end(reference)
+            while len(self.frame_cache) > FRAME_CACHE_SIZE:
+                self.frame_cache.popitem(last=False)
+            self.tracking_tab.show_frame(frame, bbox)
         elif job.kind == 'assistant' and job.token == self.assistant_token:
             self._append_assistant('FlightLens', result.text)
             self._show_assistant_trace(result.trace)
@@ -1236,7 +1640,9 @@ class Overview(QtWidgets.QMainWindow):
         elif job.kind == 'frame' and job.token == self.preview_token:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact record could not be loaded')
             self.canvas.clear_frame('Exact frame unavailable: ' + message)
-            self.tracking_tab.issue_frame.clear_frame('Exact issue frame unavailable: ' + message)
+            self.tracking_tab.clear_timeline_frame('Exact issue frame unavailable: ' + message)
+        elif job.kind == 'tracking_frame' and job.token == self.tracking_frame_token:
+            self.tracking_tab.clear_timeline_frame('Exact timeline frame unavailable: ' + message)
         elif job.kind == 'assistant' and job.token == self.assistant_token:
             if message != '':
                 self._append_assistant('FlightLens error', message)
@@ -1286,7 +1692,7 @@ class Overview(QtWidgets.QMainWindow):
                 self.episodes.setItemData(self.episodes.count()-1, f"Physics {episode.key[0]}\nEpisode {episode.key[1]}", QtCore.Qt.ItemDataRole.ToolTipRole)
             self.episodes.setCurrentIndex(data.default_episode)
         self.select_episode(data.default_episode)
-        self.status.setText(f'Loaded {len(data.episodes)} episode(s) · Read-only · Images loaded only for selected events')
+        self.status.setText(f'Loaded {len(data.episodes)} episode(s) · Read-only · Timeline images load on demand')
         self.assistant_submit.setEnabled(self.assistant is not None and self.episode is not None)
         self.assistant_generate_sql.setEnabled(self.assistant is not None and self.episode is not None)
         self.assistant_generated_sql = None
@@ -1313,6 +1719,7 @@ class Overview(QtWidgets.QMainWindow):
         self.preview_token = -1
         self.episode = episode = self.data.episodes[index]
         self.tracking_tab.set_episode(episode)
+        self.ttc_tab.set_episode(episode)
         if hasattr(self, 'assistant_plot'):
             self.assistant_plot.clear()
             self.assistant_table.clear()
@@ -1448,6 +1855,8 @@ class Overview(QtWidgets.QMainWindow):
         if self.episode is None or not np.isfinite(time_s):
             return
         self.cursor_time_s = float(time_s)
+        if hasattr(self, 'ttc_tab'):
+            self.ttc_tab.set_cursor(time_s)
         for line in self.cursors:
             with QtCore.QSignalBlocker(line):
                 line.setValue(time_s)
@@ -1472,6 +1881,22 @@ class Overview(QtWidgets.QMainWindow):
         if row is not None:
             self.events.selectRow(row)
 
+    def _request_tracking_frame(self, reference, bbox):
+        if self.data is None or reference is None:
+            return
+        if reference in self.frame_cache:
+            self.frame_cache.move_to_end(reference)
+            self.tracking_tab.show_frame(self.frame_cache[reference], bbox)
+            return
+        for job in self.jobs:
+            if job.kind == 'tracking_frame':
+                job.cancelled.set()
+        self.tracking_tab.clear_timeline_frame('Loading recorded camera frame…')
+        job = self._task('tracking_frame',
+                         lambda progress, cancel: (reference, read_frame(self.data, reference, cancel), bbox))
+        self.tracking_frame_token = job.token
+        job.start()
+
     def select_event(self):
         row = self.events.currentRow()
         if self.episode is None or not 0 <= row < len(self.episode.events):
@@ -1490,7 +1915,7 @@ class Overview(QtWidgets.QMainWindow):
         if event.frame is None:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact identity unavailable')
             self.canvas.clear_frame('Exact frame unavailable. This event has no matching recorded image identity.')
-            self.tracking_tab.issue_frame.clear_frame('No recorded camera frame for this issue.')
+            self.tracking_tab.clear_timeline_frame('No recorded camera frame for this issue.')
             return
         ref = event.frame
         when = 'unsynced event' if event.time_s is None else f'event at {event.time_s:.3f} s'

@@ -86,11 +86,17 @@ def window(application):
 def test_overview_async_loading_cursor_event_and_frame(window,application,flight_file):
     window.open_file(flight_file)
     until(application,lambda:window.data is not None and not window.jobs)
-    assert window.tabs.count()==7
+    assert window.tabs.count()==8
     assert window.tabs.tabText(2)=='MSP'
     assert window.tabs.tabText(3)=='Visual'
-    assert window.tabs.tabText(5)=='Tracking'
-    assert window.tabs.tabText(6)=='Assistant'
+    assert window.tabs.tabText(4)=='TTC'
+    assert window.tabs.tabText(6)=='Tracking'
+    assert window.tabs.tabText(7)=='Assistant'
+    assert window.tracking_tab.show_camera_frame.isChecked()
+    window.tracking_tab.show_camera_frame.setChecked(False)
+    assert window.tracking_tab.camera_stack.currentIndex() == 1
+    window.tracking_tab.show_camera_frame.setChecked(True)
+    assert window.tracking_tab.camera_stack.currentIndex() == 0
     assert len(window.tracking_tab.samples) == 1
     assert window.assistant_query_output.isReadOnly()
     assert window.assistant_submit.text()=='Run query'

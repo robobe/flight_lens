@@ -356,6 +356,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     for time_s, value in mission_rows:
         diagnostics = value.get('diagnostics') or {}
         image, mission_bbox = mission_image(value)
+        frame = frames.get(image)
         bbox = mission_bbox
         bbox_age = 0.0 if bbox is not None else None
         if bbox is None:
@@ -397,7 +398,8 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
             requested_roll_deg=degrees_value('requested_roll_rad'),
             requested_pitch_deg=degrees_value('reference_pitch_rad'),
             requested_yaw_rate_deg_s=None if rc_value is None else rc_value[1][0],
-            requested_thrust_n=float(diagnostics['thrust_n']) if isinstance(diagnostics.get('thrust_n'), (int, float)) and isfinite(diagnostics['thrust_n']) else None))
+            requested_thrust_n=float(diagnostics['thrust_n']) if isinstance(diagnostics.get('thrust_n'), (int, float)) and isfinite(diagnostics['thrust_n']) else None,
+            frame=frame))
     notices = []
     drops = [v.get('publisher_drops', 0) for topic, _, _, v in records if topic in (TRUTH, SENSORS)]
     if drops and max(drops):

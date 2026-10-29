@@ -113,6 +113,7 @@ class TrackingSample:
     requested_pitch_deg: float | None
     requested_yaw_rate_deg_s: float | None
     requested_thrust_n: float | None
+    frame: FrameRef | None = None
 
 
 @dataclass(frozen=True)
