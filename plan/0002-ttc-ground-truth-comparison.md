@@ -17,8 +17,8 @@ Test successful and non-hit episodes, metric alignment, missing oracle behavior,
 
 ## Status
 
-Pending
+Implemented
 
 ## Implementation commit
 
-Pending
+`b367df5`

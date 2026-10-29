@@ -16,8 +16,8 @@ Unit-test estimator qualification, rejection, reset, and validation behavior, th
 
 ## Status
 
-Pending
+Implemented
 
 ## Implementation commit
 
-Pending
+`b367df5`
