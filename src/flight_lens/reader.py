@@ -12,7 +12,7 @@ from foxglove_schemas_protobuf.RawImage_pb2 import RawImage
 from jsonschema import Draft202012Validator, ValidationError
 from mcap.reader import make_reader
 
-from .model import Episode, Event, FlightData, Frame, FrameRef, Summary, series
+from .model import Episode, Event, FlightData, Frame, FrameRef, Summary, TrackingSample, series
 from .estimator import estimate_attitude
 from .sqlite_index import build_index, read_derived, validate_index
 
@@ -39,6 +39,7 @@ VISION_WARNINGS = {'clipped_target', 'stale_image', 'stale_or_foreign_image', 'i
                    'attitude_unaligned', 'bearing_outside_envelope', 'association_jump', 'los_deviation'}
 MAX_JSON_BYTES = 1024 * 1024
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
+TRACKING_SAMPLE_TOLERANCE_S = 0.1
 
 
 class Cancelled(Exception):
@@ -175,6 +176,20 @@ def thrust_value(channel, backend):
     return 100. * fraction * fraction
 
 
+def yaw_rate_value(channel):
+    if type(channel) is not int or not 1000 <= channel <= 2000:
+        return None
+    return (channel - 1500) / 500 * np.degrees(2.0)
+
+
+def nearest_row(rows, time_s, tolerance=TRACKING_SAMPLE_TOLERANCE_S):
+    if not rows:
+        return None, None
+    candidate = min(rows, key=lambda row: abs(row[0] - time_s))
+    age = abs(candidate[0] - time_s)
+    return (candidate, age) if age <= tolerance else (None, None)
+
+
 def build_episode(key, records, frames, boxes, camera, health, partial, backend='internal'):
     truth = pose_rows(records, TRUTH)
     origin = 'Actual ground truth' if truth else 'Rendered pose (may use noisy sensor sources)'
@@ -191,6 +206,22 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     tracking_time = None
     sequence_times = {v.get('sequence'): t for topic, t, _, v in records
                       if topic == MISSION and t is not None and type(v.get('sequence')) is int}
+    mission_rows = [(t, v) for topic, t, _, v in records
+                    if topic == MISSION and t is not None and str(v.get('phase', '')).startswith('LOS_')]
+    bbox_rows = []
+    for topic, t, _, value in records:
+        if topic == BBOX and t is not None and value.get('bbox') is not None:
+            box = value['bbox']
+            bbox_rows.append((t, (box['x'], box['y'], box['width'], box['height'])))
+    los_rows = [(t, v) for topic, t, _, v in records if topic == LOS and t is not None]
+    actual_attitude_rows = attitude_rows(records, TRUTH) or attitude_rows(records, POSE)
+    rc_rows = []
+    for topic, _, _, value in records:
+        if topic == RC:
+            sample_time = sequence_times.get(value.get('sequence'))
+            channels = value.get('channels', [])
+            if sample_time is not None and len(channels) >= 4:
+                rc_rows.append((sample_time, (yaw_rate_value(channels[3]),)))
     for topic, t, arrival, v in sorted(records, key=lambda row: row[2]):
         if topic == SENSORS:
             baro = v['sensors'].get('barometer')
@@ -321,6 +352,52 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     camera_error_x_samples = series(camera_error_x_rows)
     camera_error_y_samples = series(camera_error_y_rows)
     thrust_samples = series(thrust_rows)
+    tracking_samples = []
+    for time_s, value in mission_rows:
+        diagnostics = value.get('diagnostics') or {}
+        image, mission_bbox = mission_image(value)
+        bbox = mission_bbox
+        bbox_age = 0.0 if bbox is not None else None
+        if bbox is None:
+            nearest, bbox_age = nearest_row(bbox_rows, time_s)
+            bbox = None if nearest is None else nearest[1]
+        dx = diagnostics.get('target_error_x_px')
+        dy = diagnostics.get('target_error_y_px')
+        if bbox is not None and camera is not None:
+            if not isinstance(dx, (int, float)) or not isfinite(dx):
+                dx = bbox[0] + bbox[2] / 2 - camera[0] / 2
+            if not isinstance(dy, (int, float)) or not isfinite(dy):
+                dy = bbox[1] + bbox[3] / 2 - camera[1] / 2
+        los, los_age = nearest_row(los_rows, time_s)
+        los_value = None if los is None else los[1]
+        attitude_value, attitude_age = nearest_row(actual_attitude_rows, time_s)
+        rc_value, _ = nearest_row(rc_rows, time_s)
+        raw_ttc = diagnostics.get('optical_ttc_raw_s', diagnostics.get('ttc_raw_s'))
+        filtered_ttc = diagnostics.get('optical_ttc_s')
+        ttc_valid = diagnostics.get('ttc_valid')
+        ttc_reason = diagnostics.get('ttc_reason')
+        if los_value is not None:
+            raw_ttc = los_value.get('optical_ttc_raw_s', los_value.get('ttc_raw_s', raw_ttc))
+            filtered_ttc = los_value.get('optical_ttc_s', filtered_ttc)
+            ttc_valid = los_value.get('ttc_valid', ttc_valid)
+            ttc_reason = los_value.get('ttc_reason', ttc_reason)
+        def degrees_value(name):
+            number = diagnostics.get(name)
+            return None if not isinstance(number, (int, float)) or not isfinite(number) else float(np.degrees(number))
+        tracking_samples.append(TrackingSample(
+            time_s=float(time_s), phase=value['phase'], reason=value['reason'],
+            navigator_state=value.get('navigator_state'), bbox=bbox, bbox_age_s=bbox_age,
+            dx_px=float(dx) if isinstance(dx, (int, float)) and isfinite(dx) else None,
+            dy_px=float(dy) if isinstance(dy, (int, float)) and isfinite(dy) else None,
+            ttc_raw_s=float(raw_ttc) if isinstance(raw_ttc, (int, float)) and isfinite(raw_ttc) else None,
+            ttc_filtered_s=float(filtered_ttc) if isinstance(filtered_ttc, (int, float)) and isfinite(filtered_ttc) else None,
+            ttc_valid=ttc_valid if isinstance(ttc_valid, bool) else None, ttc_reason=ttc_reason,
+            measured_attitude_deg=None if attitude_value is None else tuple(float(v) for v in attitude_value[1]),
+            measured_attitude_age_s=attitude_age,
+            requested_roll_deg=degrees_value('requested_roll_rad'),
+            requested_pitch_deg=degrees_value('reference_pitch_rad'),
+            requested_yaw_rate_deg_s=None if rc_value is None else rc_value[1][0],
+            requested_thrust_n=float(diagnostics['thrust_n']) if isinstance(diagnostics.get('thrust_n'), (int, float)) and isfinite(diagnostics['thrust_n']) else None))
     notices = []
     drops = [v.get('publisher_drops', 0) for topic, _, _, v in records if topic in (TRUTH, SENSORS)]
     if drops and max(drops):
@@ -368,7 +445,7 @@ def build_episode(key, records, frames, boxes, camera, health, partial, backend=
     return Episode(key, trajectory, origin, velocity_samples, barometer_velocity_samples,
                    attitude_samples, feedback_attitude_samples, msp_attitude_samples, msp_attitude_estimate,
                    ttc_raw_samples, ttc_filtered_samples, camera_error_x_samples, camera_error_y_samples,
-                   thrust_samples, tracking_time,
+                   thrust_samples, tracking_time, tuple(tracking_samples),
                    barometer_samples, goal_samples,
                    margin_samples, 'Detected bbox' if margins else 'Processed bbox',
                    events, summary, tuple(notices), tuple(t for t, _ in contexts), tuple(d for _, d in contexts),

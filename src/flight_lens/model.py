@@ -94,6 +94,28 @@ class Summary:
 
 
 @dataclass(frozen=True)
+class TrackingSample:
+    time_s: float
+    phase: str
+    reason: str
+    navigator_state: str | None
+    bbox: tuple | None
+    bbox_age_s: float | None
+    dx_px: float | None
+    dy_px: float | None
+    ttc_raw_s: float | None
+    ttc_filtered_s: float | None
+    ttc_valid: bool | None
+    ttc_reason: str | None
+    measured_attitude_deg: tuple | None
+    measured_attitude_age_s: float | None
+    requested_roll_deg: float | None
+    requested_pitch_deg: float | None
+    requested_yaw_rate_deg_s: float | None
+    requested_thrust_n: float | None
+
+
+@dataclass(frozen=True)
 class Episode:
     key: tuple[str, str]
     trajectory: Series
@@ -110,6 +132,7 @@ class Episode:
     camera_error_y: Series
     thrust: Series
     tracking_time_s: float | None
+    tracking_samples: tuple[TrackingSample, ...]
     barometer: Series
     goal: Series
     margins: Series

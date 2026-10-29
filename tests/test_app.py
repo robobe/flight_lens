@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from PySide6 import QtWidgets
 
-from flight_lens.app import ErdDialog, ExportDialog, Overview, load_config, sql_chart
+from flight_lens.app import ErdDialog, ExportDialog, Overview, TrackingReplay, load_config, sql_chart
+from flight_lens.model import TrackingSample
 from flight_lens.reader import load_flight, Cancelled
 
 
@@ -49,6 +50,27 @@ def test_sql_result_table_graph_and_erd(application):
     window.close()
 
 
+def test_tracking_replay_sub_one_speed_and_categorized_readout(application):
+    replay = TrackingReplay()
+    sample = lambda t, phase: TrackingSample(
+        time_s=t, phase=phase, reason='tracking', navigator_state='LOS', bbox=None,
+        bbox_age_s=None, dx_px=2., dy_px=-3., ttc_raw_s=1., ttc_filtered_s=.9,
+        ttc_valid=True, ttc_reason=None, measured_attitude_deg=(1., 2., 3.),
+        measured_attitude_age_s=.01, requested_roll_deg=4., requested_pitch_deg=5.,
+        requested_yaw_rate_deg_s=6., requested_thrust_n=7.,
+    )
+    replay.samples = (sample(0., 'LOS_APPROACH'), sample(.2, 'LOS_DESCENT'))
+    replay.index = 0
+    replay.playing = True
+    replay.speed.setCurrentIndex(1)  # 0.25x
+    replay.last_wall = time.monotonic() - 1.
+    replay._tick()
+    assert replay.index == 1
+    assert replay.category_values['dx'].text() == '+2.000 px'
+    assert replay.category_values['ttc valid'].text() == 'True'
+    replay.close()
+
+
 @pytest.fixture
 def window(application):
     view=Overview()
@@ -64,10 +86,12 @@ def window(application):
 def test_overview_async_loading_cursor_event_and_frame(window,application,flight_file):
     window.open_file(flight_file)
     until(application,lambda:window.data is not None and not window.jobs)
-    assert window.tabs.count()==6
+    assert window.tabs.count()==7
     assert window.tabs.tabText(2)=='MSP'
     assert window.tabs.tabText(3)=='Visual'
-    assert window.tabs.tabText(5)=='Assistant'
+    assert window.tabs.tabText(5)=='Tracking'
+    assert window.tabs.tabText(6)=='Assistant'
+    assert len(window.tracking_tab.samples) == 1
     assert window.assistant_query_output.isReadOnly()
     assert window.assistant_submit.text()=='Run query'
     assert window.assistant_prompt.toPlainText() == ''

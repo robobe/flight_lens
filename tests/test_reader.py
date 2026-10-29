@@ -34,6 +34,9 @@ def test_truth_summary_events_and_exact_frame(flight_file):
     assert set(episode.camera_error_x.values[:,0].tolist()) == {-2.}
     assert set(episode.camera_error_y.values[:,0].tolist()) == {0.}
     assert episode.tracking_time_s==pytest.approx(.3)
+    assert len(episode.tracking_samples) == 1
+    assert episode.tracking_samples[-1].phase == 'LOS_APPROACH'
+    assert episode.tracking_samples[0].dx_px is None
     warnings=[e for e in episode.events if e.severity=='warning']
     assert len(warnings)==2  # Separate rejection intervals, not 100 Hz packet counts.
     assert warnings[0].time_s==.1 and warnings[0].end_s==.2

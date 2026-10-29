@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from threading import Event as CancelEvent
+import time
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -27,6 +28,13 @@ VISUAL_FILTERED_COLOR = '#70d6ad'
 TTC_DISPLAY_PERCENTILE = 95.
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
+TRACKING_TIMER_INTERVAL_MS = 30
+TRACKING_SAMPLE_TOLERANCE_S = 0.0001
+BALL_RADIUS_PX = 112.0
+BALL_CENTER_X_PX = 132.0
+BALL_CENTER_Y_PX = 132.0
+BALL_PITCH_SCALE_PX_PER_DEG = 3.0
+BALL_MAX_PITCH_DEG = 35.0
 DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
 SQL_EXAMPLES = (
     'Show the first 20 mission events with their times and reasons.',
@@ -222,6 +230,370 @@ class ErdDialog(QtWidgets.QDialog):
         close.clicked.connect(self.accept)
         layout.addWidget(close, 0, QtCore.Qt.AlignmentFlag.AlignRight)
 
+
+class TrackingReplay(QtWidgets.QWidget):
+    SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+    issue_selected = QtCore.Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.samples = ()
+        self.issue_events = ()
+        self.issue_times = ()
+        self.issue_index = -1
+        self.index = -1
+        self.playing = False
+        self.last_wall = None
+        self.playback_elapsed_s = 0.0
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(TRACKING_TIMER_INTERVAL_MS)
+        self.timer.timeout.connect(self._tick)
+        root = QtWidgets.QVBoxLayout(self)
+        controls = QtWidgets.QHBoxLayout()
+        self.previous = QtWidgets.QPushButton('◀ Step')
+        self.previous.clicked.connect(lambda: self.step(-1))
+        self.next = QtWidgets.QPushButton('Step ▶')
+        self.next.clicked.connect(lambda: self.step(1))
+        self.play = QtWidgets.QPushButton('Play')
+        self.play.clicked.connect(self.toggle_play)
+        self.reset = QtWidgets.QPushButton('Reset')
+        self.reset.clicked.connect(self.reset_replay)
+        self.previous_issue = QtWidgets.QPushButton('◀ Issue')
+        self.previous_issue.setToolTip('Jump to the previous warning or error')
+        self.previous_issue.clicked.connect(lambda: self.jump_issue(-1))
+        self.next_issue = QtWidgets.QPushButton('Issue ▶')
+        self.next_issue.setToolTip('Jump to the next warning or error')
+        self.next_issue.clicked.connect(lambda: self.jump_issue(1))
+        self.issue_count = QtWidgets.QLabel('Issues: 0')
+        self.speed = QtWidgets.QComboBox()
+        for value in self.SPEEDS:
+            self.speed.addItem(f'{value:g}×', value)
+        for widget in (self.previous, self.next, self.play, self.reset, self.previous_issue, self.next_issue):
+            controls.addWidget(widget)
+        controls.addWidget(self.issue_count)
+        controls.addWidget(QtWidgets.QLabel('Simulation rate'))
+        controls.addWidget(self.speed)
+        controls.addStretch(1)
+        root.addLayout(controls)
+        body = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        camera_panel = QtWidgets.QWidget()
+        camera_layout = QtWidgets.QVBoxLayout(camera_panel)
+        camera_layout.setContentsMargins(0, 0, 0, 0)
+        camera_header = QtWidgets.QHBoxLayout()
+        self.progress = QtWidgets.QLabel('No LOS tracking samples')
+        camera_header.addWidget(self.progress, 1)
+        self.camera_frame_counter = QtWidgets.QLabel('Frame —/—')
+        camera_header.addWidget(self.camera_frame_counter)
+        camera_layout.addLayout(camera_header)
+        self.camera_timeline = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.camera_timeline.setRange(0, 0)
+        self.camera_timeline.setEnabled(False)
+        self.camera_timeline.setToolTip('Scrub through tracking samples')
+        self.camera_timeline.valueChanged.connect(self._seek_from_timeline)
+        camera_layout.addWidget(self.camera_timeline)
+        self.camera_scene = QtWidgets.QGraphicsScene(self)
+        self.camera_view = QtWidgets.QGraphicsView(self.camera_scene)
+        self.camera_view.setMinimumSize(520, 390)
+        self.camera_view.setBackgroundBrush(QtGui.QColor('#101c2a'))
+        camera_layout.addWidget(self.camera_view, 1)
+        body.addWidget(camera_panel)
+        self.ball_scene = QtWidgets.QGraphicsScene(self)
+        self.ball_view = QtWidgets.QGraphicsView(self.ball_scene)
+        self.ball_view.setMinimumSize(250, 220)
+        self.ball_view.setBackgroundBrush(QtGui.QColor('#101c2a'))
+        body.addWidget(self.ball_view)
+        panel = QtWidgets.QWidget()
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.addWidget(QtWidgets.QLabel('Tracking sample'))
+        self.category_layout = QtWidgets.QVBoxLayout()
+        self.category_layout.setSpacing(8)
+        self.category_values = {}
+        for title, fields in (
+            ('Tracking', ('phase', 'reason', 'navigator')),
+            ('Camera / target', ('dx', 'dy', 'bbox age')),
+            ('Time to contact', ('ttc raw', 'ttc filtered', 'ttc valid')),
+            ('Attitude', ('attitude age', 'measured R/P/Y')),
+            ('Command', ('roll', 'pitch', 'yaw rate', 'thrust')),
+        ):
+            group = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QFormLayout(group)
+            form.setContentsMargins(8, 6, 8, 6)
+            form.setHorizontalSpacing(12)
+            for field in fields:
+                value = QtWidgets.QLabel('—')
+                value.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+                value.setStyleSheet('font:11px monospace; color:#d9e6f4')
+                form.addRow(QtWidgets.QLabel(field + ':'), value)
+                self.category_values[field] = value
+            self.category_layout.addWidget(group)
+        self.category_layout.addStretch(1)
+        panel_layout.addLayout(self.category_layout, 1)
+        issue_group = QtWidgets.QGroupBox('Issue explanation · recorded evidence')
+        issue_layout = QtWidgets.QVBoxLayout(issue_group)
+        self.issue_explanation = QtWidgets.QPlainTextEdit()
+        self.issue_explanation.setReadOnly(True)
+        self.issue_explanation.setMaximumHeight(150)
+        self.issue_explanation.setStyleSheet('font:11px monospace; background:#101c2a')
+        issue_layout.addWidget(self.issue_explanation)
+        panel_layout.addWidget(issue_group)
+        self.issue_frame = FrameCanvas()
+        self.issue_frame.setMinimumSize(220, 150)
+        self.issue_frame.setMaximumHeight(190)
+        panel_layout.addWidget(self.issue_frame)
+        body.addWidget(panel)
+        body.setSizes([570, 280, 360])
+        root.addWidget(body, 1)
+        self.setEnabled(False)
+
+    def _seek_from_timeline(self, index):
+        if not self.samples or index == self.index:
+            return
+        self.playing = False
+        self.timer.stop()
+        self.play.setText('Play')
+        self.playback_elapsed_s = 0.0
+        self.index = max(0, min(len(self.samples) - 1, int(index)))
+        self._render()
+
+    def set_episode(self, episode):
+        self.samples = tuple(episode.tracking_samples)
+        self.issue_events = tuple(sorted(
+            (event for event in episode.events if event.severity in ('warning', 'error') and event.time_s is not None),
+            key=lambda event: (event.time_s, event.arrival_ns),
+        ))
+        self.issue_times = tuple(event.time_s for event in self.issue_events)
+        self.issue_index = -1
+        self.index = 0 if self.samples else -1
+        self.playing = False
+        self.timer.stop()
+        self.playback_elapsed_s = 0.0
+        self.play.setText('Play')
+        self.setEnabled(bool(self.samples))
+        self.camera_timeline.setRange(0, max(0, len(self.samples) - 1))
+        self.camera_timeline.setEnabled(bool(self.samples))
+        self.previous_issue.setEnabled(bool(self.issue_times))
+        self.next_issue.setEnabled(bool(self.issue_times))
+        self.issue_count.setText(f'Issues: {len(self.issue_events)}')
+        self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
+        self.issue_frame.clear_frame('Select an issue to load its recorded camera frame.')
+        self._render()
+
+    def reset_replay(self):
+        self.playing = False
+        self.timer.stop()
+        self.playback_elapsed_s = 0.0
+        self.play.setText('Play')
+        self.index = 0 if self.samples else -1
+        self.camera_timeline.setValue(max(0, self.index))
+        self.issue_index = -1
+        self.issue_count.setText(f'Issues: {len(self.issue_events)}')
+        self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
+        self.issue_frame.clear_frame('Select an issue to load its recorded camera frame.')
+        self._render()
+
+    def step(self, delta):
+        if self.samples:
+            self.index = max(0, min(len(self.samples) - 1, self.index + delta))
+            self._render()
+
+    def jump_issue(self, delta):
+        if not self.samples or not self.issue_times:
+            return
+        self.issue_index = max(0, min(len(self.issue_times) - 1, self.issue_index + delta))
+        target_time = self.issue_times[self.issue_index]
+        self.index = min(range(len(self.samples)), key=lambda idx: abs(self.samples[idx].time_s - target_time))
+        self.playing = False
+        self.timer.stop()
+        self.play.setText('Play')
+        event = self.issue_events[self.issue_index]
+        self.issue_count.setText(f'Issue {self.issue_index + 1}/{len(self.issue_events)}')
+        self.issue_explanation.setPlainText(self._explain_issue(event))
+        self.issue_selected.emit(event)
+        self._render()
+
+    def show_frame(self, frame, bbox):
+        self.issue_frame.show_frame(frame, bbox)
+
+    @staticmethod
+    def _explain_issue(event):
+        details = plain(event.details)
+        if event.component == 'vision':
+            interpretation = (
+                'The vision pipeline reported a degraded target measurement. Tracking may hold the last '
+                'usable bearing, limit the command, or enter recovery until a fresh target is available.'
+            )
+        elif event.component == 'navigation':
+            interpretation = (
+                'The navigator entered RECOVER. The controller is prioritizing a safe fallback over normal '
+                'target-centering commands.'
+            )
+        elif event.component == 'phase' and event.phase == 'FAULT':
+            interpretation = (
+                'The mission declared a terminal fault. Inspect the preceding tracking samples and limits '
+                'to find the control condition that led to this transition.'
+            )
+        elif event.component == 'physics':
+            interpretation = 'The physics/backend reported an error, so subsequent control behavior may be invalid.'
+        elif event.component == 'renderer':
+            interpretation = 'The renderer reported an error. This can explain missing visual evidence, but not by itself a flight-control failure.'
+        else:
+            interpretation = 'This event was recorded by the flight runtime; inspect the surrounding replay samples for its control effect.'
+        checks = (
+            ('vision reason', details.get('vision_reason')),
+            ('image age', details.get('image_age_s')),
+            ('bbox', details.get('processed_bbox') or details.get('latest_image')),
+            ('dx', details.get('target_error_x_px')),
+            ('dy', details.get('target_error_y_px')),
+            ('TTC raw', details.get('optical_ttc_raw_s', details.get('ttc_raw_s'))),
+            ('TTC valid', details.get('ttc_valid')),
+            ('attitude age', details.get('attitude_age_s')),
+            ('thrust saturated', details.get('thrust_saturated')),
+            ('angle limited', details.get('angle_limited')),
+            ('slew limited', details.get('slew_limited')),
+        )
+        evidence = '\n'.join(f'  {name}: {"available" if value is not None else "missing"}' for name, value in checks)
+        when = 'unsynced' if event.time_s is None else f'{event.time_s:.3f} s'
+        interval = '' if event.time_s is None or event.end_s is None or event.end_s <= event.time_s else f'–{event.end_s:.3f} s'
+        return '\n'.join((
+            f'{event.severity.upper()} · {event.component} · {event.phase or "phase unavailable"}',
+            f'time: {when}{interval}',
+            f'reason: {event.reason}',
+            '',
+            'Why this matters for control:',
+            interpretation,
+            '',
+            'Recorded evidence availability:',
+            evidence,
+            '',
+            'Raw recorded details:',
+            json.dumps(details, indent=2, sort_keys=True),
+        ))
+
+    def toggle_play(self):
+        if not self.samples:
+            return
+        self.playing = not self.playing
+        self.play.setText('Pause' if self.playing else 'Play')
+        self.last_wall = time.monotonic()
+        if self.playing:
+            self.playback_elapsed_s = 0.0
+        self.timer.start() if self.playing else self.timer.stop()
+
+    def _tick(self):
+        if not self.playing or not self.samples:
+            return
+        now = time.monotonic()
+        self.playback_elapsed_s += (now - (self.last_wall or now)) * float(self.speed.currentData())
+        self.last_wall = now
+        while self.index < len(self.samples) - 1:
+            delta = max(0., self.samples[self.index + 1].time_s - self.samples[self.index].time_s)
+            if self.playback_elapsed_s < delta:
+                break
+            self.playback_elapsed_s -= delta
+            self.index += 1
+        self._render()
+        if self.index >= len(self.samples) - 1:
+            self.playing = False
+            self.timer.stop()
+            self.play.setText('Play')
+
+    def _render(self):
+        self.camera_scene.clear()
+        self.ball_scene.clear()
+        if self.index < 0:
+            self.progress.setText('No LOS tracking samples')
+            self.camera_frame_counter.setText('Frame —/—')
+            self.camera_timeline.setEnabled(False)
+            for value in self.category_values.values():
+                value.setText('—')
+                value.setStyleSheet('font:11px monospace; color:#d9e6f4')
+            return
+        sample = self.samples[self.index]
+        width, height = 640., 480.
+        self.camera_scene.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor('#58b8f5'), 3))
+        center_pen = QtGui.QPen(QtGui.QColor('#70d6ad'), 2)
+        self.camera_scene.addLine(width / 2 - 14, height / 2, width / 2 + 14, height / 2, center_pen)
+        self.camera_scene.addLine(width / 2, height / 2 - 14, width / 2, height / 2 + 14, center_pen)
+        if sample.bbox is not None:
+            self.camera_scene.addRect(*sample.bbox, QtGui.QPen(QtGui.QColor('#eab85a'), 3))
+        self.camera_view.fitInView(self.camera_scene.itemsBoundingRect().adjusted(-12, -12, 12, 12), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+        self._render_ball(sample)
+        fmt = lambda value, unit='': '—' if value is None else f'{value:+.3f}{unit}'
+        attitude = '—' if sample.measured_attitude_deg is None else '/'.join(f'{v:+.2f}°' for v in sample.measured_attitude_deg)
+        self.progress.setText(f'{self.index + 1}/{len(self.samples)} · t={sample.time_s:.3f}s · {sample.phase}')
+        with QtCore.QSignalBlocker(self.camera_timeline):
+            self.camera_timeline.setValue(self.index)
+        self.camera_frame_counter.setText(f'Frame {self.index + 1}/{len(self.samples)}')
+        values = {
+            'phase': sample.phase,
+            'reason': sample.reason,
+            'navigator': sample.navigator_state or '—',
+            'dx': fmt(sample.dx_px, ' px'),
+            'dy': fmt(sample.dy_px, ' px'),
+            'bbox age': fmt(sample.bbox_age_s, ' s'),
+            'ttc raw': fmt(sample.ttc_raw_s, ' s'),
+            'ttc filtered': fmt(sample.ttc_filtered_s, ' s'),
+            'ttc valid': str(sample.ttc_valid) if sample.ttc_valid is not None else '—',
+            'attitude age': fmt(sample.measured_attitude_age_s, ' s'),
+            'measured R/P/Y': attitude,
+            'roll': fmt(sample.requested_roll_deg, '°'),
+            'pitch': fmt(sample.requested_pitch_deg, '°'),
+            'yaw rate': fmt(sample.requested_yaw_rate_deg_s, '°/s'),
+            'thrust': fmt(sample.requested_thrust_n, ' N'),
+        }
+        for field, value in values.items():
+            self.category_values[field].setText(value)
+        self.category_values['phase'].setStyleSheet(
+            'font: bold 11px monospace; color:#70d6ad'
+        )
+        ttc_color = '#70d6ad' if sample.ttc_valid is True else '#ff8282' if sample.ttc_valid is False else '#d9e6f4'
+        for field in ('ttc raw', 'ttc filtered', 'ttc valid'):
+            self.category_values[field].setStyleSheet(f'font: bold 11px monospace; color:{ttc_color}')
+
+    def _render_ball(self, sample):
+        radius, cx, cy = BALL_RADIUS_PX, BALL_CENTER_X_PX, BALL_CENTER_Y_PX
+        center = QtCore.QPointF(cx, cy)
+        self.ball_scene.addEllipse(cx - radius, cy - radius, radius * 2, radius * 2,
+                                   QtGui.QPen(QtGui.QColor('#58b8f5'), 3), QtGui.QBrush(QtGui.QColor('#203950')))
+        roll = 0. if sample.measured_attitude_deg is None else np.radians(sample.measured_attitude_deg[0])
+        pitch = 0. if sample.measured_attitude_deg is None else sample.measured_attitude_deg[1]
+        pitch = max(-BALL_MAX_PITCH_DEG, min(BALL_MAX_PITCH_DEG, pitch))
+        offset = pitch * BALL_PITCH_SCALE_PX_PER_DEG
+        # Pitch ladder: five-degree marks make small attitude changes visible.
+        ladder_pen = QtGui.QPen(QtGui.QColor('#9bb0c8'), 1)
+        for pitch_mark in range(-30, 31, 5):
+            mark_offset = pitch_mark * BALL_PITCH_SCALE_PX_PER_DEG
+            half_width = 30. if pitch_mark % 10 else 44.
+            y = cy + mark_offset
+            self.ball_scene.addLine(cx - half_width, y, cx + half_width, y, ladder_pen)
+            if pitch_mark % 10 == 0 and pitch_mark:
+                label = self.ball_scene.addText(f'{abs(pitch_mark)}°')
+                label.setDefaultTextColor(QtGui.QColor('#9bb0c8'))
+                label.setPos(cx + half_width + 5, y - 9)
+        line = QtCore.QLineF(center + QtCore.QPointF(-130 * np.cos(roll), offset - 130 * np.sin(roll)),
+                             center + QtCore.QPointF(130 * np.cos(roll), offset + 130 * np.sin(roll)))
+        self.ball_scene.addLine(line, QtGui.QPen(QtGui.QColor('#eab85a'), 4))
+        # Roll scale around the top half of the ball.
+        for roll_mark in (-60, -45, -30, -15, 0, 15, 30, 45, 60):
+            angle = np.radians(roll_mark - 90)
+            inner = radius - (13 if roll_mark % 30 == 0 else 8)
+            outer = radius - 2
+            self.ball_scene.addLine(
+                cx + inner * np.cos(angle), cy + inner * np.sin(angle),
+                cx + outer * np.cos(angle), cy + outer * np.sin(angle),
+                QtGui.QPen(QtGui.QColor('#d9e6f4'), 2 if roll_mark % 30 == 0 else 1),
+            )
+            if roll_mark in (-60, -30, 30, 60):
+                label = self.ball_scene.addText(f'{abs(roll_mark)}°')
+                label.setDefaultTextColor(QtGui.QColor('#9bb0c8'))
+                label.setPos(cx + (outer + 4) * np.cos(angle) - 8, cy + (outer + 4) * np.sin(angle) - 8)
+        pen = QtGui.QPen(QtGui.QColor('#70d6ad'), 2)
+        self.ball_scene.addLine(cx - 18, cy, cx + 18, cy, pen)
+        self.ball_scene.addLine(cx, cy - 18, cx, cy + 18, pen)
+        self.ball_scene.setSceneRect(0, 0, cx * 2, cy * 2)
+        self.ball_view.fitInView(self.ball_scene.sceneRect().adjusted(-10, -10, 10, 10), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+
 class Overview(QtWidgets.QMainWindow):
     def __init__(self, assistant_model=None):
         super().__init__()
@@ -296,6 +668,9 @@ class Overview(QtWidgets.QMainWindow):
         self.tabs.addTab(self.visual_tab, 'Visual')
         self.velocity_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.velocity_tab, 'Velocity')
+        self.tracking_tab = TrackingReplay()
+        self.tracking_tab.issue_selected.connect(self._select_tracking_issue)
+        self.tabs.addTab(self.tracking_tab, 'Tracking')
         self.assistant_tab = QtWidgets.QWidget()
         self.tabs.addTab(self.assistant_tab, 'Assistant')
         outer.addWidget(self.tabs)
@@ -807,6 +1182,7 @@ class Overview(QtWidgets.QMainWindow):
             while len(self.frame_cache) > FRAME_CACHE_SIZE:
                 self.frame_cache.popitem(last=False)
             self.canvas.show_frame(frame, bbox)
+            self.tracking_tab.show_frame(frame, bbox)
         elif job.kind == 'assistant' and job.token == self.assistant_token:
             self._append_assistant('FlightLens', result.text)
             self._show_assistant_trace(result.trace)
@@ -830,6 +1206,7 @@ class Overview(QtWidgets.QMainWindow):
         elif job.kind == 'frame' and job.token == self.preview_token:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact record could not be loaded')
             self.canvas.clear_frame('Exact frame unavailable: ' + message)
+            self.tracking_tab.issue_frame.clear_frame('Exact issue frame unavailable: ' + message)
         elif job.kind == 'assistant' and job.token == self.assistant_token:
             if message != '':
                 self._append_assistant('FlightLens error', message)
@@ -905,6 +1282,7 @@ class Overview(QtWidgets.QMainWindow):
                 job.cancelled.set()
         self.preview_token = -1
         self.episode = episode = self.data.episodes[index]
+        self.tracking_tab.set_episode(episode)
         if hasattr(self, 'assistant_plot'):
             self.assistant_plot.clear()
             self.assistant_table.clear()
@@ -1057,6 +1435,13 @@ class Overview(QtWidgets.QMainWindow):
             return 'unavailable' if value is None else 'yes' if value else 'no'
         self.readout.setText(f'Cursor {time_s:.3f} s · {context.get("phase", "phase unavailable")} · Image age {age_text} · Thrust saturated {flag("thrust_saturated")} · Angle limited {flag("angle_limited")} · Slew limited {flag("slew_limited")}')
 
+    def _select_tracking_issue(self, event):
+        if self.episode is None:
+            return
+        row = next((index for index, candidate in enumerate(self.episode.events) if candidate == event), None)
+        if row is not None:
+            self.events.selectRow(row)
+
     def select_event(self):
         row = self.events.currentRow()
         if self.episode is None or not 0 <= row < len(self.episode.events):
@@ -1075,12 +1460,14 @@ class Overview(QtWidgets.QMainWindow):
         if event.frame is None:
             self.preview_caption.setText('EVENT CAMERA FRAME · Exact identity unavailable')
             self.canvas.clear_frame('Exact frame unavailable. This event has no matching recorded image identity.')
+            self.tracking_tab.issue_frame.clear_frame('No recorded camera frame for this issue.')
             return
         ref = event.frame
         when = 'unsynced event' if event.time_s is None else f'event at {event.time_s:.3f} s'
         self.preview_caption.setText(f'EXACT EVENT FRAME · {when} · frame {ref.identity[3]}\nPreview stays tied to this event when the cursor moves')
         if ref in self.frame_cache:
             self.canvas.show_frame(self.frame_cache[ref], event.bbox)
+            self.tracking_tab.show_frame(self.frame_cache[ref], event.bbox)
             return
         self.canvas.clear_frame('Loading exact event frame…')
         data = self.data
