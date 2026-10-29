@@ -279,18 +279,28 @@ class TrackingReplay(QtWidgets.QWidget):
         camera_panel = QtWidgets.QWidget()
         camera_layout = QtWidgets.QVBoxLayout(camera_panel)
         camera_layout.setContentsMargins(0, 0, 0, 0)
+        camera_layout.setSpacing(8)
+        timeline_group = QtWidgets.QGroupBox('Replay timeline')
+        timeline_group.setStyleSheet(
+            'QGroupBox { border:1px solid #426983; border-radius:5px; margin-top:8px; padding:8px; }'
+            'QGroupBox::title { subcontrol-origin: margin; left:10px; padding:0 4px; color:#70d6ad; }'
+        )
+        timeline_layout = QtWidgets.QVBoxLayout(timeline_group)
+        timeline_layout.setContentsMargins(8, 8, 8, 8)
+        timeline_layout.setSpacing(5)
         camera_header = QtWidgets.QHBoxLayout()
         self.progress = QtWidgets.QLabel('No LOS tracking samples')
         camera_header.addWidget(self.progress, 1)
         self.camera_frame_counter = QtWidgets.QLabel('Frame —/—')
         camera_header.addWidget(self.camera_frame_counter)
-        camera_layout.addLayout(camera_header)
+        timeline_layout.addLayout(camera_header)
         self.camera_timeline = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.camera_timeline.setRange(0, 0)
         self.camera_timeline.setEnabled(False)
         self.camera_timeline.setToolTip('Scrub through tracking samples')
         self.camera_timeline.valueChanged.connect(self._seek_from_timeline)
-        camera_layout.addWidget(self.camera_timeline)
+        timeline_layout.addWidget(self.camera_timeline)
+        camera_layout.addWidget(timeline_group)
         self.camera_scene = QtWidgets.QGraphicsScene(self)
         self.camera_view = QtWidgets.QGraphicsView(self.camera_scene)
         self.camera_view.setMinimumSize(520, 390)
@@ -301,7 +311,15 @@ class TrackingReplay(QtWidgets.QWidget):
         self.ball_view = QtWidgets.QGraphicsView(self.ball_scene)
         self.ball_view.setMinimumSize(250, 220)
         self.ball_view.setBackgroundBrush(QtGui.QColor('#101c2a'))
-        body.addWidget(self.ball_view)
+        ball_panel = QtWidgets.QWidget()
+        ball_layout = QtWidgets.QVBoxLayout(ball_panel)
+        ball_layout.setContentsMargins(0, 0, 0, 0)
+        ball_layout.addWidget(self.ball_view, 1)
+        self.issue_frame = FrameCanvas()
+        self.issue_frame.setMinimumSize(220, 150)
+        self.issue_frame.setMaximumHeight(190)
+        ball_layout.addWidget(self.issue_frame)
+        body.addWidget(ball_panel)
         panel = QtWidgets.QWidget()
         panel_layout = QtWidgets.QVBoxLayout(panel)
         panel_layout.addWidget(QtWidgets.QLabel('Tracking sample'))
@@ -332,16 +350,14 @@ class TrackingReplay(QtWidgets.QWidget):
         issue_layout = QtWidgets.QVBoxLayout(issue_group)
         self.issue_explanation = QtWidgets.QPlainTextEdit()
         self.issue_explanation.setReadOnly(True)
-        self.issue_explanation.setMaximumHeight(150)
-        self.issue_explanation.setStyleSheet('font:11px monospace; background:#101c2a')
+        self.issue_explanation.setMinimumHeight(250)
+        self.issue_explanation.setMaximumHeight(360)
+        self.issue_explanation.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.issue_explanation.setStyleSheet('font:12px sans-serif; background:#101c2a; padding:6px')
         issue_layout.addWidget(self.issue_explanation)
         panel_layout.addWidget(issue_group)
-        self.issue_frame = FrameCanvas()
-        self.issue_frame.setMinimumSize(220, 150)
-        self.issue_frame.setMaximumHeight(190)
-        panel_layout.addWidget(self.issue_frame)
         body.addWidget(panel)
-        body.setSizes([570, 280, 360])
+        body.setSizes([650, 390, 560])
         root.addWidget(body, 1)
         self.setEnabled(False)
 
@@ -418,25 +434,34 @@ class TrackingReplay(QtWidgets.QWidget):
     def _explain_issue(event):
         details = plain(event.details)
         if event.component == 'vision':
+            trigger = (
+                f'diagnostics.vision_reason == {details.get("vision_reason")!r}; '
+                'during LOS, vision_reason == "no_target" is also treated as a warning.'
+            )
             interpretation = (
                 'The vision pipeline reported a degraded target measurement. Tracking may hold the last '
                 'usable bearing, limit the command, or enter recovery until a fresh target is available.'
             )
         elif event.component == 'navigation':
+            trigger = f'navigator_state == "RECOVER" with mission reason {event.reason!r}.'
             interpretation = (
                 'The navigator entered RECOVER. The controller is prioritizing a safe fallback over normal '
                 'target-centering commands.'
             )
         elif event.component == 'phase' and event.phase == 'FAULT':
+            trigger = f'mission.phase == "FAULT" and mission.reason == {event.reason!r}.'
             interpretation = (
                 'The mission declared a terminal fault. Inspect the preceding tracking samples and limits '
                 'to find the control condition that led to this transition.'
             )
         elif event.component == 'physics':
+            trigger = f'simulation/state.state == "error" and state.reason == {event.reason!r}.'
             interpretation = 'The physics/backend reported an error, so subsequent control behavior may be invalid.'
         elif event.component == 'renderer':
+            trigger = f'analysis/render/health.stats.error is present: {event.reason!r}.'
             interpretation = 'The renderer reported an error. This can explain missing visual evidence, but not by itself a flight-control failure.'
         else:
+            trigger = f'recorded event category {event.component!r} with reason {event.reason!r}.'
             interpretation = 'This event was recorded by the flight runtime; inspect the surrounding replay samples for its control effect.'
         checks = (
             ('vision reason', details.get('vision_reason')),
@@ -459,11 +484,16 @@ class TrackingReplay(QtWidgets.QWidget):
             f'time: {when}{interval}',
             f'reason: {event.reason}',
             '',
-            'Why this matters for control:',
+            'Trigger condition:',
+            trigger,
+            '',
+            'What it means for control:',
             interpretation,
             '',
-            'Recorded evidence availability:',
+            'Recorded evidence (available means the field was present):',
             evidence,
+            '',
+            'Important: missing evidence does not create an issue by itself. It only limits how confidently the replay can explain the control response.',
             '',
             'Raw recorded details:',
             json.dumps(details, indent=2, sort_keys=True),
@@ -611,8 +641,8 @@ class Overview(QtWidgets.QMainWindow):
         self.last_error = ''
         self.cursor_time_s = 0.
         self.setWindowTitle('FlightLens · Flight Overview')
-        self.resize(1480, 980)
-        self.setMinimumSize(1100, 760)
+        self.resize(1760, 1040)
+        self.setMinimumSize(1350, 820)
         pg.setConfigOptions(background='#101c2a', foreground='#c8d5e6', antialias=False, useOpenGL=False)
         self.setStyleSheet('''
             QMainWindow, QWidget { background:#142233; color:#d9e6f4; font:13px sans-serif; }
