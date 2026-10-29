@@ -135,6 +135,24 @@ failures and cancellation preserve existing files. The original MCAP is never
 modified. Export currently supports one selected episode and front camera at a
 time; audio and other overlays are not included.
 
+## SQLite llama.cpp example
+
+The standalone `examples/sqlite_llama_query.py` script creates a deterministic
+SQLite table with 1,000 `(time, value)` samples, asks the local GGUF model to
+translate natural language into SQL, validates the result as a read-only
+`SELECT`, and executes at most 50 rows.
+
+Run it from this directory with the configured model:
+
+```bash
+uv run --locked --extra assistant python examples/sqlite_llama_query.py
+```
+
+The REPL prints example prompts when it starts. Use `--assistant-model` to
+override the YAML model path or `--database` to choose the demo database file.
+Generated SQL is displayed before the bounded result table. Writes, multiple
+statements, unknown tables/columns, and oversized limits are rejected.
+
 ## Development and checks
 
 ```bash
