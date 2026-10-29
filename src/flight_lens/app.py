@@ -15,7 +15,7 @@ import yaml
 from .reader import Cancelled, load_flight, read_frame
 from .model import series
 from .video import export_mp4
-from .assistant import LlamaCppBackend, McapAssistant
+from .assistant import LlamaCppBackend, McapAnalysisTools, McapAssistant
 
 COLORS = ['#58b8f5', '#eab85a', '#70d6ad', '#c299f0']
 ATTITUDE_MEASURED_COLOR = '#58b8f5'
@@ -28,6 +28,17 @@ TTC_DISPLAY_PERCENTILE = 95.
 SEVERITY = {'info': '#9bb0c8', 'warning': '#eab85a', 'error': '#ff8282'}
 FRAME_CACHE_SIZE = 3
 DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
+SQL_EXAMPLES = (
+    'Show the first 20 mission events with their times and reasons.',
+    'Plot altitude and vertical speed around the first fault.',
+    'List telemetry fields with their maximum values.',
+    'Show requested roll, output roll, and target X error over time.',
+)
+ERD_TABLES = {
+    'selected_episode': ('id PK', 'physics_id', 'episode_id', 'duration_s', 'outcome'),
+    'selected_telemetry': ('episode_id FK', 'topic', 'path', 'time_s', 'value', 'source'),
+    'selected_events': ('episode_id FK', 'time_s', 'end_time_s', 'severity', 'component', 'reason'),
+}
 
 
 def plain(value):
@@ -36,6 +47,32 @@ def plain(value):
     if isinstance(value, tuple):
         return [plain(v) for v in value]
     return value
+
+
+def sql_chart(result):
+    columns = result.get('columns', []) if isinstance(result, Mapping) else []
+    rows = result.get('rows', []) if isinstance(result, Mapping) else []
+    if len(columns) < 2 or not rows:
+        return None
+    numeric = lambda value: isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+    x_index = 0 if all(row and numeric(row[0]) for row in rows) else None
+    if x_index is None:
+        numeric_columns = [index for index in range(len(columns)) if all(len(row) > index and numeric(row[index]) for row in rows)]
+        if not numeric_columns:
+            return None
+        x_index = numeric_columns[0]
+        x_values = list(range(len(rows)))
+    else:
+        x_values = [float(row[x_index]) for row in rows]
+    series = []
+    for index, column in enumerate(columns):
+        if index == x_index or not all(len(row) > index and numeric(row[index]) for row in rows):
+            continue
+        series.append({'name': column, 'unit': '', 'values': [float(row[index]) for row in rows]})
+    if not series:
+        return None
+    return dict(type='line_chart', title='SQL query result', x_label=columns[x_index], x_unit='',
+                x=x_values, series=series[:8])
 
 
 def load_config(path):
@@ -143,6 +180,48 @@ class ExportDialog(QtWidgets.QDialog):
             self.destination.setText(path)
 
 
+class ErdDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('FlightLens database ERD')
+        self.resize(900, 560)
+        layout = QtWidgets.QVBoxLayout(self)
+        help_text = QtWidgets.QLabel(
+            'SQL is scoped to the selected episode. Join selected_telemetry or selected_events '
+            'to selected_episode using episode_id. Use time_s for time-series graphs.')
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+        view = QtWidgets.QGraphicsView()
+        view.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        view.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        scene = QtWidgets.QGraphicsScene(view)
+        view.setScene(scene)
+        layout.addWidget(view, 1)
+        positions = {'selected_episode': (30, 50), 'selected_telemetry': (360, 20), 'selected_events': (360, 300)}
+        boxes = {}
+        for name, columns in ERD_TABLES.items():
+            x, y = positions[name]
+            width, height = 270, 42 + 22 * len(columns)
+            rect = scene.addRect(x, y, width, height, QtGui.QPen(QtGui.QColor('#58b8f5')), QtGui.QBrush(QtGui.QColor('#203950')))
+            boxes[name] = (rect, x, y, width, height)
+            title = scene.addText(name)
+            title.setDefaultTextColor(QtGui.QColor('#70d6ad'))
+            title.setFont(QtGui.QFont('Sans', 11, QtGui.QFont.Weight.Bold))
+            title.setPos(x + 10, y + 7)
+            for index, column in enumerate(columns):
+                item = scene.addText(column)
+                item.setDefaultTextColor(QtGui.QColor('#d7e5f2'))
+                item.setPos(x + 12, y + 36 + index * 22)
+        episode = boxes['selected_episode']
+        for target_name, target in (('selected_telemetry', boxes['selected_telemetry']), ('selected_events', boxes['selected_events'])):
+            scene.addLine(episode[1] + episode[3], episode[2] + episode[4] / 2,
+                          target[1], target[2] + 50, QtGui.QPen(QtGui.QColor('#eab85a'), 2))
+        scene.setSceneRect(scene.itemsBoundingRect().adjusted(-30, -30, 30, 30))
+        view.fitInView(scene.sceneRect(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+        close = QtWidgets.QPushButton('Close')
+        close.clicked.connect(self.accept)
+        layout.addWidget(close, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+
 class Overview(QtWidgets.QMainWindow):
     def __init__(self, assistant_model=None):
         super().__init__()
@@ -153,6 +232,8 @@ class Overview(QtWidgets.QMainWindow):
         self.serial = self.load_token = self.preview_token = 0
         self.export_token = -1
         self.assistant_token = -1
+        self.assistant_generated_sql = None
+        self.assistant_sql_episode_key = None
         self.closing = False
         self.frame_cache = OrderedDict()
         self.last_error = ''
@@ -412,11 +493,16 @@ class Overview(QtWidgets.QMainWindow):
             'Plot altitude and vertical speed around the first fault.',
             'Plot X, Z, and slant velocity during target search.',
             'Compare actual and estimated attitude.',
+            *SQL_EXAMPLES,
         ))
         use_example = QtWidgets.QPushButton('Use example prompt')
-        use_example.clicked.connect(lambda: self.assistant_prompt.setText(examples.currentText()))
+        use_example.clicked.connect(lambda: self.assistant_prompt.setPlainText(examples.currentText()))
         left_layout.addWidget(examples)
         left_layout.addWidget(use_example)
+        self.assistant_erd_button = QtWidgets.QPushButton('Open database ERD')
+        self.assistant_erd_button.clicked.connect(self.open_assistant_erd)
+        self.assistant_erd_button.setEnabled(False)
+        left_layout.addWidget(self.assistant_erd_button)
         self.assistant_transcript = QtWidgets.QPlainTextEdit()
         self.assistant_transcript.setReadOnly(True)
         self.assistant_transcript.setPlaceholderText('Assistant answers will appear here.')
@@ -428,35 +514,81 @@ class Overview(QtWidgets.QMainWindow):
         self.assistant_query_output.setMaximumHeight(180)
         self.assistant_query_output.setStyleSheet('font:10px monospace; background:#101c2a')
         left_layout.addWidget(self.assistant_query_output)
-        self.assistant_prompt = QtWidgets.QLineEdit()
-        self.assistant_prompt.setPlaceholderText('Ask about the selected episode…')
-        self.assistant_prompt.returnPressed.connect(self.ask_assistant)
+        left_layout.addWidget(QtWidgets.QLabel('Custom prompt'))
+        self.assistant_prompt = QtWidgets.QPlainTextEdit()
+        self.assistant_prompt.setPlaceholderText('Enter a custom question about the selected episode…')
+        self.assistant_prompt.setMaximumHeight(78)
         left_layout.addWidget(self.assistant_prompt)
         controls = QtWidgets.QHBoxLayout()
-        self.assistant_graph = QtWidgets.QCheckBox('Show result as graph')
-        self.assistant_graph.setChecked(True)
+        controls.addWidget(QtWidgets.QLabel('Result view:'))
+        self.assistant_graph = QtWidgets.QComboBox()
+        self.assistant_graph.addItems(('Table', 'Graph'))
+        self.assistant_graph.currentTextChanged.connect(self._refresh_assistant_result_view)
         controls.addWidget(self.assistant_graph)
         self.assistant_submit = QtWidgets.QPushButton('Run query')
         self.assistant_submit.clicked.connect(self.ask_assistant)
         controls.addWidget(self.assistant_submit)
+        self.assistant_generate_sql = QtWidgets.QPushButton('Generate SQL')
+        self.assistant_generate_sql.clicked.connect(self.generate_sql)
+        controls.addWidget(self.assistant_generate_sql)
+        self.assistant_run_sql = QtWidgets.QPushButton('Run SQL')
+        self.assistant_run_sql.clicked.connect(self.run_sql)
+        self.assistant_run_sql.setEnabled(False)
+        controls.addWidget(self.assistant_run_sql)
         self.assistant_cancel = QtWidgets.QPushButton('Cancel')
         self.assistant_cancel.clicked.connect(self.cancel_assistant)
         self.assistant_cancel.hide()
         controls.addWidget(self.assistant_cancel)
         left_layout.addLayout(controls)
         split.addWidget(left)
+        result_panel = QtWidgets.QWidget()
+        result_layout = QtWidgets.QVBoxLayout(result_panel)
+        self.assistant_result_status = QtWidgets.QLabel('SQL results will appear here.')
+        self.assistant_result_status.setWordWrap(True)
+        result_layout.addWidget(self.assistant_result_status)
+        self.assistant_table = QtWidgets.QTableWidget()
+        self.assistant_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.assistant_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        result_layout.addWidget(self.assistant_table, 1)
         self.assistant_plot = pg.PlotWidget(title='Assistant chart result')
         self.assistant_plot.setLabel('bottom', 'Simulation time', units='s')
         self.assistant_plot.setLabel('left', 'Value')
         self.assistant_plot.showGrid(x=True, y=True, alpha=.15)
         self.assistant_plot.addLegend(offset=(10, 5), labelTextSize='10pt')
-        split.addWidget(self.assistant_plot)
+        result_layout.addWidget(self.assistant_plot, 1)
+        split.addWidget(result_panel)
         split.setSizes([620, 760])
         layout.addWidget(split, 1)
         enabled = self.assistant is not None
-        self.assistant_prompt.setEnabled(enabled)
+        self.assistant_prompt.setEnabled(True)
         self.assistant_submit.setEnabled(enabled)
+        self.assistant_generate_sql.setEnabled(enabled)
         self.assistant_graph.setEnabled(enabled)
+        self._refresh_assistant_result_view()
+
+    def open_assistant_erd(self):
+        if self.data is not None and self.data.index_path is not None:
+            ErdDialog(self).exec()
+
+    def _show_assistant_table(self, result):
+        if not isinstance(result, dict) or not isinstance(result.get('columns'), list):
+            self.assistant_table.clear()
+            self.assistant_table.setRowCount(0)
+            self.assistant_table.setColumnCount(0)
+            return
+        columns, rows = result['columns'], result.get('rows', [])
+        self.assistant_table.setColumnCount(len(columns))
+        self.assistant_table.setHorizontalHeaderLabels([str(column) for column in columns])
+        self.assistant_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column_index, value in enumerate(row[:len(columns)]):
+                self.assistant_table.setItem(row_index, column_index, QtWidgets.QTableWidgetItem(str(value)))
+        self.assistant_table.resizeColumnsToContents()
+
+    def _refresh_assistant_result_view(self):
+        graph = self.assistant_graph.currentText() == 'Graph'
+        self.assistant_table.setVisible(not graph)
+        self.assistant_plot.setVisible(graph)
 
     def ask_assistant(self):
         if self.assistant is None or self.data is None or self.episode is None:
@@ -464,7 +596,7 @@ class Overview(QtWidgets.QMainWindow):
             return
         if any(job.kind == 'assistant' for job in self.jobs):
             return
-        prompt = self.assistant_prompt.text().strip()
+        prompt = self.assistant_prompt.toPlainText().strip()
         if not prompt:
             self.assistant_status.setText('Enter a question or choose an example prompt.')
             return
@@ -478,6 +610,43 @@ class Overview(QtWidgets.QMainWindow):
         self._append_assistant('You', prompt)
         job.start()
 
+    def generate_sql(self):
+        if self.assistant is None or self.data is None or self.episode is None:
+            self.assistant_status.setText('Load an MCAP and configure --assistant-model first.')
+            return
+        if any(job.kind in ('assistant', 'sql_preview', 'sql_run') for job in self.jobs):
+            return
+        prompt = self.assistant_prompt.toPlainText().strip()
+        if not prompt:
+            self.assistant_status.setText('Enter a custom prompt first.')
+            return
+        data, episode = self.data, self.episode
+        job = self._task('sql_preview', lambda progress, cancel: self.assistant.generate_sql(
+            data, episode, prompt, cancel=cancel))
+        self.assistant_token = job.token
+        self.assistant_generate_sql.setEnabled(False)
+        self.assistant_run_sql.setEnabled(False)
+        self.assistant_cancel.show()
+        self.assistant_status.setText('Generating SQL without executing it…')
+        self._append_assistant('You', prompt)
+        job.start()
+
+    def run_sql(self):
+        if (self.data is None or self.episode is None or not self.assistant_generated_sql
+                or self.assistant_sql_episode_key != self.episode.key):
+            self.assistant_status.setText('Generate valid SQL for the selected episode first.')
+            return
+        if any(job.kind in ('assistant', 'sql_preview', 'sql_run') for job in self.jobs):
+            return
+        data, episode, sql = self.data, self.episode, self.assistant_generated_sql
+        job = self._task('sql_run', lambda progress, cancel: McapAnalysisTools(data, episode).query_sql(sql))
+        self.assistant_token = job.token
+        self.assistant_run_sql.setEnabled(False)
+        self.assistant_generate_sql.setEnabled(False)
+        self.assistant_cancel.show()
+        self.assistant_status.setText('Running validated SQL…')
+        job.start()
+
     def cancel_assistant(self):
         for job in self.jobs:
             if job.kind == 'assistant':
@@ -488,13 +657,18 @@ class Overview(QtWidgets.QMainWindow):
         self.assistant_transcript.appendPlainText(f'{speaker}: {text}')
 
     def _show_assistant_trace(self, trace):
-        self.assistant_query_output.setPlainText('\n\n'.join(
-            f"{item['name']}({json.dumps(item['arguments'], sort_keys=True)})\n"
-            f"{json.dumps(item['result'], indent=2, sort_keys=True)}" for item in trace))
+        rendered = []
+        for item in trace:
+            result = item['result']
+            if item.get('name') == 'query_sql' and isinstance(result, dict):
+                result = dict(result, rows=result.get('rows', [])[:20], preview=True)
+            rendered.append(f"{item['name']}({json.dumps(item['arguments'], sort_keys=True)})\n"
+                            f"{json.dumps(result, indent=2, sort_keys=True)}")
+        self.assistant_query_output.setPlainText('\n\n'.join(rendered))
 
     def _show_assistant_chart(self, chart):
         self.assistant_plot.clear()
-        if not chart or not self.assistant_graph.isChecked():
+        if not chart:
             return
         self.assistant_plot.setTitle(chart['title'])
         self.assistant_plot.setLabel('bottom', chart['x_label'], units=chart['x_unit'])
@@ -503,6 +677,26 @@ class Overview(QtWidgets.QMainWindow):
                                      name=f"{item['name']} ({item['unit']})" if item['unit'] else item['name'],
                                      connect='finite')
         self.assistant_plot.enableAutoRange()
+
+    def _show_assistant_result(self, trace):
+        sql_result = next((item['result'] for item in reversed(trace)
+                           if item.get('name') == 'query_sql' and isinstance(item.get('result'), dict)), None)
+        self._show_assistant_table(sql_result)
+        if sql_result is None:
+            self.assistant_result_status.setText('No SQL table result.')
+            return
+        self.assistant_result_status.setText(
+            f"SQL: {sql_result.get('sql', '')}\nRows: {sql_result.get('row_count', 0)}")
+        self._show_assistant_chart(sql_chart(sql_result))
+        self._refresh_assistant_result_view()
+
+    def _show_sql_preview(self, result):
+        self.assistant_generated_sql = result['sql']
+        self.assistant_sql_episode_key = self.episode.key
+        self.assistant_query_output.setPlainText('SQL preview (not executed):\n' + result['sql'])
+        self.assistant_result_status.setText('SQL validated successfully. Click Run SQL to execute it.')
+        self.assistant_run_sql.setEnabled(True)
+        self.assistant_status.setText('SQL ready. It has not been executed.')
 
     def choose_file(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Open flight recording', '', 'MCAP recordings (*.mcap *.partial);;All files (*)')
@@ -594,6 +788,16 @@ class Overview(QtWidgets.QMainWindow):
             return
         if job.kind == 'load' and job.token == self.load_token:
             self.apply_data(result)
+        elif job.kind == 'sql_preview' and job.token == self.assistant_token:
+            self._show_sql_preview(result)
+        elif job.kind == 'sql_run' and job.token == self.assistant_token:
+            trace = ({'name': 'query_sql', 'arguments': {'sql': result['sql']}, 'result': result},)
+            self._show_assistant_trace(trace)
+            self._show_assistant_table(result)
+            self._show_assistant_chart(sql_chart(result))
+            self._refresh_assistant_result_view()
+            self.assistant_result_status.setText(f"SQL executed. Rows: {result['row_count']}")
+            self.assistant_status.setText('SQL complete.')
         elif job.kind == 'export' and job.token == self.export_token:
             self.status.setText(f'Exported MP4: {result}')
         elif job.kind == 'frame' and job.token == self.preview_token:
@@ -607,6 +811,7 @@ class Overview(QtWidgets.QMainWindow):
             self._append_assistant('FlightLens', result.text)
             self._show_assistant_trace(result.trace)
             self._show_assistant_chart(result.chart)
+            self._show_assistant_result(result.trace)
             self.assistant_status.setText('Ready.')
 
     def _failed(self, job, message):
@@ -629,6 +834,10 @@ class Overview(QtWidgets.QMainWindow):
             if message != '':
                 self._append_assistant('FlightLens error', message)
             self.assistant_status.setText('Assistant failed: ' + message)
+        elif job.kind == 'sql_preview' and job.token == self.assistant_token:
+            self.assistant_status.setText('SQL generation failed: ' + message)
+        elif job.kind == 'sql_run' and job.token == self.assistant_token:
+            self.assistant_status.setText('SQL execution failed: ' + message)
 
     def _finished(self, job):
         self.jobs.discard(job)
@@ -642,6 +851,13 @@ class Overview(QtWidgets.QMainWindow):
             self.assistant_submit.setEnabled(self.assistant is not None and self.data is not None)
             if job.token == self.assistant_token and job.cancelled.is_set() and not self.closing:
                 self.assistant_status.setText('Assistant request cancelled.')
+        elif job.kind in ('sql_preview', 'sql_run'):
+            self.assistant_cancel.hide()
+            self.assistant_generate_sql.setEnabled(self.assistant is not None and self.data is not None and not any(
+                j.kind in ('assistant', 'sql_preview', 'sql_run') for j in self.jobs))
+            self.assistant_run_sql.setEnabled(self.assistant_generated_sql is not None and self.assistant_sql_episode_key == (self.episode.key if self.episode else None))
+            if job.token == self.assistant_token and job.cancelled.is_set() and not self.closing:
+                self.assistant_status.setText('SQL request cancelled.')
         job.deleteLater()
         if self.closing and not self.jobs:
             self.close()
@@ -665,6 +881,11 @@ class Overview(QtWidgets.QMainWindow):
         self.select_episode(data.default_episode)
         self.status.setText(f'Loaded {len(data.episodes)} episode(s) · Read-only · Images loaded only for selected events')
         self.assistant_submit.setEnabled(self.assistant is not None and self.episode is not None)
+        self.assistant_generate_sql.setEnabled(self.assistant is not None and self.episode is not None)
+        self.assistant_generated_sql = None
+        self.assistant_sql_episode_key = None
+        self.assistant_run_sql.setEnabled(False)
+        self.assistant_erd_button.setEnabled(self.data.index_path is not None)
         self.assistant_status.setText('Ready.') if self.assistant is not None else None
 
     def _curve(self, plot, samples, column, label, color, dashed=False):
@@ -686,7 +907,14 @@ class Overview(QtWidgets.QMainWindow):
         self.episode = episode = self.data.episodes[index]
         if hasattr(self, 'assistant_plot'):
             self.assistant_plot.clear()
+            self.assistant_table.clear()
+            self.assistant_table.setRowCount(0)
+            self.assistant_table.setColumnCount(0)
+            self.assistant_result_status.setText('SQL results will appear here.')
             self.assistant_query_output.clear()
+            self.assistant_generated_sql = None
+            self.assistant_sql_episode_key = None
+            self.assistant_run_sql.setEnabled(False)
         summary = episode.summary
         number = lambda value: 'Unavailable' if value is None else f'{value:.2f} m'
         values = {'Outcome': summary.outcome, 'Duration': f'{summary.duration_s:.2f} s',

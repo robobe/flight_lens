@@ -7,7 +7,7 @@ import re
 import numpy as np
 
 from .model import Episode, FlightData, Series
-from .sqlite_index import list_fields, query_fields
+from .sqlite_index import list_fields, query_fields, query_sql, validate_sql
 
 
 MAX_QUERY_POINTS = 80
@@ -22,6 +22,7 @@ SERIES_NAMES = ('x', 'y', 'z', 'slant', 'velocity_x', 'velocity_y', 'velocity_z'
                 'slant_velocity', 'altitude', 'barometer_altitude', 'vertical_speed',
                 'attitude_roll', 'attitude_pitch', 'attitude_yaw', 'thrust')
 CHART_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+SQL_BLOCK_RE = re.compile(r"```(?:sql)?\s*(.*?)\s*```", re.IGNORECASE | re.DOTALL)
 XML_TOOL_RE = re.compile(r'<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>', re.DOTALL)
 XML_PARAMETER_RE = re.compile(r'<parameter=([^>]+)>\s*(.*?)\s*</parameter>', re.DOTALL)
 
@@ -35,6 +36,14 @@ class AssistantResult:
     text: str
     chart: dict | None = None
     trace: tuple = ()
+
+
+def extract_sql(text):
+    match = SQL_BLOCK_RE.search(text or '')
+    sql = (match.group(1) if match else text or '').strip()
+    if sql.endswith(';'):
+        sql = sql[:-1].rstrip()
+    return sql
 
 
 def _bounded_series(series: Series, max_points=MAX_QUERY_POINTS):
@@ -88,6 +97,8 @@ class McapAnalysisTools:
             return self.query_data(arguments.get('fields'), arguments.get('start_time_s'),
                                    arguments.get('end_time_s'), arguments.get('max_points', MAX_QUERY_POINTS),
                                    arguments.get('aggregation', 'raw'))
+        if name == 'query_sql':
+            return self.query_sql(arguments.get('sql'))
         if name == 'list_series':
             return self.list_series()
         if name == 'context_at':
@@ -141,12 +152,23 @@ class McapAnalysisTools:
             raise ValueError('recording index is unavailable')
         return list_fields(self.data.index_path, self.episode.key)
 
+    def query_sql(self, sql):
+        if self.data.index_path is None:
+            raise ValueError('recording index is unavailable')
+        return query_sql(self.data.index_path, self.episode.key, sql)
+
+    def preview_sql(self, sql):
+        if self.data.index_path is None:
+            raise ValueError('recording index is unavailable')
+        return dict(sql=validate_sql(self.data.index_path, self.episode.key, sql), valid=True)
+
 
 TOOL_DEFINITIONS = [
     {'type': 'function', 'function': {'name': 'recording_summary', 'description': 'Return the selected flight summary.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'find_events', 'description': 'Find recorded flight events.', 'parameters': {'type': 'object', 'properties': {'severity': {'type': 'string', 'enum': ['info', 'warning', 'error']}, 'limit': {'type': 'integer', 'maximum': MAX_EVENTS}}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'query_series', 'description': 'Return bounded numeric telemetry samples. Names include x, z, slant, altitude, vertical_speed, attitude_roll, attitude_pitch, attitude_yaw, and thrust.', 'parameters': {'type': 'object', 'required': ['name'], 'properties': {'name': {'type': 'string', 'enum': SERIES_NAMES}, 'start_time_s': {'type': 'number'}, 'end_time_s': {'type': 'number'}, 'max_points': {'type': 'integer', 'maximum': MAX_QUERY_POINTS}}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'query_data', 'description': 'Query bounded numeric telemetry fields from the indexed recording. Use topic and JSON field path from the recording.', 'parameters': {'type': 'object', 'required': ['fields'], 'properties': {'fields': {'type': 'array', 'minItems': 1, 'maxItems': 8, 'items': {'type': 'object', 'required': ['topic', 'path'], 'properties': {'topic': {'type': 'string'}, 'path': {'type': 'string'}, 'name': {'type': 'string'}}, 'additionalProperties': False}}, 'start_time_s': {'type': 'number'}, 'end_time_s': {'type': 'number'}, 'max_points': {'type': 'integer', 'maximum': 500}, 'aggregation': {'type': 'string', 'enum': ['raw', 'mean', 'min', 'max', 'rms']}}, 'additionalProperties': False}}},
+    {'type': 'function', 'function': {'name': 'query_sql', 'description': 'Run one read-only SELECT against selected_episode, selected_telemetry, and selected_events. Results are limited to 500 rows.', 'parameters': {'type': 'object', 'required': ['sql'], 'properties': {'sql': {'type': 'string'}}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'list_series', 'description': 'List numeric topic and JSON field paths available in the indexed episode.', 'parameters': {'type': 'object', 'properties': {}, 'additionalProperties': False}}},
     {'type': 'function', 'function': {'name': 'context_at', 'description': 'Return recorded context near a simulation time.', 'parameters': {'type': 'object', 'required': ['time_s'], 'properties': {'time_s': {'type': 'number'}}, 'additionalProperties': False}}},
 ]
@@ -155,6 +177,11 @@ TOOL_DEFINITIONS = [
 SYSTEM_PROMPT = """You are FlightLens, a read-only flight-recording analyst.
 Use the provided analysis tools instead of guessing. Never claim data that was not returned by a tool.
 Use query_series for common aliases and query_data for indexed topic/field paths.
+Use query_sql when the user asks for joins, raw fields, events, or a table-shaped result.
+SQL may read only selected_episode(id, physics_id, episode_id, duration_s, outcome),
+selected_telemetry(episode_id, topic, path, time_s, value, source), and
+selected_events(episode_id, time_s, end_time_s, severity, component, reason).
+Join telemetry or events to selected_episode on episode_id and return one SELECT statement.
 Keep answers concise and reference simulation times when useful.
 If a graph helps, return one JSON object in a fenced json block with this shape:
 {"type":"line_chart","title":"...","x_label":"Simulation time","x_unit":"s","x":[...],"series":[{"name":"...","unit":"...","values":[...]}]}
@@ -255,6 +282,18 @@ def parse_xml_tool_calls(content):
 class McapAssistant:
     def __init__(self, backend):
         self.backend = backend
+
+    def generate_sql(self, data, episode, prompt, cancel=lambda: False):
+        if cancel():
+            raise AssistantCancelled()
+        messages = [{'role': 'system', 'content': SYSTEM_PROMPT +
+                     '\nFor this request, return only one SQL SELECT statement. Do not execute any tool.'},
+                    {'role': 'user', 'content': prompt}]
+        response = self.backend.complete(messages, [])
+        message = response['choices'][0]['message']
+        sql = extract_sql(message.get('content', ''))
+        result = McapAnalysisTools(data, episode).preview_sql(sql)
+        return result
 
     def answer(self, data, episode, prompt, cancel=lambda: False, progress=lambda message: None):
         tools = McapAnalysisTools(data, episode)

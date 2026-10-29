@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from PySide6 import QtWidgets
 
-from flight_lens.app import ExportDialog, Overview, load_config
+from flight_lens.app import ErdDialog, ExportDialog, Overview, load_config, sql_chart
 from flight_lens.reader import load_flight, Cancelled
 
 
@@ -30,6 +30,25 @@ def test_load_config_reads_assistant_model(tmp_path):
     assert load_config(path) == {'assistant_model': '/models/flight.gguf'}
 
 
+def test_sql_result_table_graph_and_erd(application):
+    result = {'sql': 'SELECT time_s, value FROM selected_telemetry LIMIT 2',
+              'columns': ['time_s', 'value'], 'rows': [[0.0, 1.0], [1.0, 2.0]],
+              'row_count': 2, 'truncated': False}
+    assert sql_chart(result)['series'][0]['values'] == [1.0, 2.0]
+    window = Overview()
+    window._show_assistant_result(({'name': 'query_sql', 'result': result},))
+    assert window.assistant_table.rowCount() == 2
+    window.assistant_graph.setCurrentText('Graph')
+    application.processEvents()
+    assert not window.assistant_table.isVisible()
+    dialog = ErdDialog(window)
+    view = dialog.findChild(QtWidgets.QGraphicsView)
+    assert 'selected_telemetry' in '\n'.join(item.toPlainText() for item in view.scene().items()
+                                               if isinstance(item, QtWidgets.QGraphicsTextItem))
+    dialog.close()
+    window.close()
+
+
 @pytest.fixture
 def window(application):
     view=Overview()
@@ -51,6 +70,9 @@ def test_overview_async_loading_cursor_event_and_frame(window,application,flight
     assert window.tabs.tabText(5)=='Assistant'
     assert window.assistant_query_output.isReadOnly()
     assert window.assistant_submit.text()=='Run query'
+    assert window.assistant_prompt.toPlainText() == ''
+    assert window.assistant_generate_sql.text() == 'Generate SQL'
+    assert not window.assistant_run_sql.isEnabled()
     assert len(window.visual_plots)==3
     assert len(window.visual_plots[0].plotItem.legend.items)==1
     assert window.events.rowCount()==len(window.episode.events)

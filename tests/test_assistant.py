@@ -29,6 +29,32 @@ def test_mcap_tools_return_bounded_summary_and_series(flight_file):
     assert {'topic': 'analysis/app/msp', 'path': 'attitude.yaw_rad'} in tools.call('list_series', {})
 
 
+def test_sql_tool_scopes_episode_and_rejects_unsafe_queries(flight_file):
+    data = load_flight(flight_file)
+    tools = McapAnalysisTools(data, data.episodes[0])
+    result = tools.call('query_sql', {'sql': 'SELECT time_s, value FROM selected_telemetry ORDER BY time_s'})
+    assert result['columns'] == ['time_s', 'value']
+    assert result['row_count'] <= 500
+    assert result['sql'].endswith('LIMIT 500')
+    with pytest.raises(ValueError, match='read-only'):
+        tools.call('query_sql', {'sql': 'DELETE FROM selected_telemetry'})
+    with pytest.raises(ValueError, match='cannot exceed'):
+        tools.call('query_sql', {'sql': 'SELECT * FROM selected_events LIMIT 501'})
+
+
+def test_generate_sql_validates_without_executing(flight_file):
+    data = load_flight(flight_file)
+
+    class Backend:
+        def complete(self, messages, tools):
+            assert tools == []
+            return {'choices': [{'message': {'content':
+                '```sql\nSELECT time_s, value FROM selected_telemetry LIMIT 2\n```'}}]}
+
+    result = McapAssistant(Backend()).generate_sql(data, data.episodes[0], 'Show two telemetry samples.')
+    assert result == {'sql': 'SELECT time_s, value FROM selected_telemetry LIMIT 2', 'valid': True}
+
+
 class FakeBackend:
     def __init__(self):
         self.calls = 0

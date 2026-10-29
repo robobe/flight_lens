@@ -6,6 +6,8 @@ import numpy as np
 
 INDEX_VERSION = 1
 SIDECAR_SUFFIX = '.flightlens.sqlite'
+SQL_MAX_ROWS = 500
+SQL_TABLES = {'selected_episode', 'selected_telemetry', 'selected_events'}
 
 
 SCHEMA = """
@@ -165,3 +167,75 @@ def read_derived(index_path, episode_key, names):
         return {name: connection.execute(
             'SELECT time_s,value FROM telemetry WHERE episode_id=? AND topic=? AND path=? ORDER BY time_s',
             (episode[0], 'derived', name)).fetchall() for name in names}
+
+
+def _sql_authorizer(action, first, second, database, source):
+    if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_FUNCTION):
+        return sqlite3.SQLITE_OK
+    if action == sqlite3.SQLITE_READ:
+        return sqlite3.SQLITE_OK if first in SQL_TABLES else sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_DENY
+
+
+def _bounded_sql(sql):
+    sql = str(sql).strip()
+    if not sql or not sql.lower().startswith('select') or ';' in sql or '--' in sql or '/*' in sql:
+        raise ValueError('SQL must be one read-only SELECT statement')
+    import re
+    match = re.search(r'\blimit\s+(\d+)\b', sql, re.IGNORECASE)
+    if match is None:
+        sql += f' LIMIT {SQL_MAX_ROWS}'
+    elif int(match.group(1)) > SQL_MAX_ROWS:
+        raise ValueError(f'SQL result limit cannot exceed {SQL_MAX_ROWS} rows')
+    return sql
+
+
+def _selected_connection(index_path, episode_key):
+    connection = sqlite3.connect(index_path)
+    connection.execute('CREATE TEMP TABLE selected_episode AS SELECT * FROM main.episodes WHERE physics_id=? AND episode_id=?', episode_key)
+    connection.execute('CREATE TEMP TABLE selected_telemetry AS SELECT t.* FROM main.telemetry t JOIN temp.selected_episode e ON e.id=t.episode_id')
+    connection.execute('CREATE TEMP TABLE selected_events AS SELECT t.* FROM main.events t JOIN temp.selected_episode e ON e.id=t.episode_id')
+    connection.execute('PRAGMA query_only=ON')
+    return connection
+
+
+def _validate_sql_connection(connection, sql):
+    sql = _bounded_sql(sql)
+    connection.set_authorizer(_sql_authorizer)
+    try:
+        connection.execute(f'EXPLAIN QUERY PLAN {sql}').fetchall()
+    except sqlite3.Error as error:
+        raise ValueError(f'SQL query failed: {error}') from error
+    finally:
+        connection.set_authorizer(None)
+    return sql
+
+
+def validate_sql(index_path, episode_key, sql):
+    """Validate one bounded SELECT without reading result rows."""
+    connection = _selected_connection(index_path, episode_key)
+    try:
+        return _validate_sql_connection(connection, sql)
+    finally:
+        connection.close()
+
+
+def query_sql(index_path, episode_key, sql):
+    """Run one bounded SELECT against selected-episode temporary views."""
+    connection = _selected_connection(index_path, episode_key)
+    sql = _bounded_sql(sql)
+    try:
+        sql = _validate_sql_connection(connection, sql)
+        connection.set_authorizer(_sql_authorizer)
+        try:
+            cursor = connection.execute(sql)
+            rows = cursor.fetchmany(SQL_MAX_ROWS)
+            columns = [item[0] for item in cursor.description or ()]
+        except sqlite3.Error as error:
+            raise ValueError(f'SQL query failed: {error}') from error
+        finally:
+            connection.set_authorizer(None)
+        return dict(sql=sql, columns=columns, rows=[list(row) for row in rows],
+                    row_count=len(rows), truncated=len(rows) == SQL_MAX_ROWS)
+    finally:
+        connection.close()
