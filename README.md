@@ -23,6 +23,18 @@ uv run --locked --all-packages --all-extras --all-groups flight-lens \
   ../bullet_render/recordings/<flight>.mcap
 ```
 
+For a small deterministic development recording, generate or open the checked-in
+demo fixture:
+
+```bash
+uv run --locked --package flight-lens python examples/create_demo_mcap.py
+uv run --locked --package flight-lens flight-lens examples/demo.mcap
+```
+
+The generator is the source of truth for `examples/demo.mcap`. It contains one
+short successful episode with ground truth, tracking bbox/dx/dy, TTC, a linked
+8×6 camera frame, and a target-hit completion event.
+
 Workspace task **FlightLens: Open** starts the same desktop window. Click **Open
 MCAP…** to select a local recording. No browser, server, live flight connection,
 configuration edits or changes to the original recording are involved. PySide6
