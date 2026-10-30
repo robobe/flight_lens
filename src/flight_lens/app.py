@@ -40,6 +40,10 @@ BALL_CENTER_Y_PX = 132.0
 BALL_PITCH_SCALE_PX_PER_DEG = 3.0
 BALL_MAX_PITCH_DEG = 35.0
 DEFAULT_CONFIG_PATH = Path('config/flight_lens.yaml')
+TRACKING_CSV_COLUMNS = (
+    'time_s', 'phase', 'reason', 'bbox_x', 'bbox_y', 'bbox_width', 'bbox_height',
+    'bbox_age_s', 'dx_px', 'dy_px',
+)
 SQL_EXAMPLES = (
     'Show the first 20 mission events with their times and reasons.',
     'Plot altitude and vertical speed around the first fault.',
@@ -51,6 +55,34 @@ ERD_TABLES = {
     'selected_telemetry': ('episode_id FK', 'topic', 'path', 'time_s', 'value', 'source'),
     'selected_events': ('episode_id FK', 'time_s', 'end_time_s', 'severity', 'component', 'reason'),
 }
+
+
+def mark_export_button(button):
+    """Apply the shared visual/accessibility marker used by export actions."""
+    button.setObjectName('exportButton')
+    button.setProperty('buttonRole', 'export')
+    button.setToolTip(button.toolTip() or 'Export data to a local file')
+    return button
+
+
+def tracking_csv_rows(samples):
+    """Return CSV-ready tracking rows while preserving samples with missing data."""
+    rows = []
+    for sample in samples:
+        bbox = sample.bbox
+        rows.append({
+            'time_s': sample.time_s,
+            'phase': sample.phase,
+            'reason': sample.reason,
+            'bbox_x': None if bbox is None else bbox[0],
+            'bbox_y': None if bbox is None else bbox[1],
+            'bbox_width': None if bbox is None else bbox[2],
+            'bbox_height': None if bbox is None else bbox[3],
+            'bbox_age_s': sample.bbox_age_s,
+            'dx_px': sample.dx_px,
+            'dy_px': sample.dy_px,
+        })
+    return rows
 
 
 def plain(value):
@@ -270,6 +302,11 @@ class TrackingReplay(QtWidgets.QWidget):
         self.next_issue.setToolTip('Jump to the next warning or error')
         self.next_issue.clicked.connect(lambda: self.jump_issue(1))
         self.issue_count = QtWidgets.QLabel('Issues: 0')
+        self.export_button = mark_export_button(QtWidgets.QPushButton('Export tracking CSV'))
+        self.export_button.clicked.connect(self._export_csv)
+        self.export_button.setToolTip('Export bbox geometry and dx/dy tracking errors over time')
+        self.export_status = QtWidgets.QLabel('')
+        self.export_status.setStyleSheet('color:#9bb0c8')
         self.show_camera_frame = QtWidgets.QCheckBox('Show recorded image')
         self.show_camera_frame.setChecked(True)
         self.show_camera_frame.setToolTip('Use the exact recorded MCAP image in the camera view')
@@ -280,6 +317,8 @@ class TrackingReplay(QtWidgets.QWidget):
         for widget in (self.previous, self.next, self.play, self.reset, self.previous_issue, self.next_issue):
             controls.addWidget(widget)
         controls.addWidget(self.issue_count)
+        controls.addWidget(self.export_button)
+        controls.addWidget(self.export_status)
         controls.addWidget(self.show_camera_frame)
         controls.addWidget(QtWidgets.QLabel('Simulation rate'))
         controls.addWidget(self.speed)
@@ -406,6 +445,7 @@ class TrackingReplay(QtWidgets.QWidget):
         self.next_issue.setEnabled(bool(self.issue_times))
         self.issue_count.setText(f'Issues: {len(self.issue_events)}')
         self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
+        self.export_status.setText('')
         self.camera_image.clear_frame('Move the timeline to load the matching recorded camera frame.')
         self._render()
 
@@ -419,6 +459,7 @@ class TrackingReplay(QtWidgets.QWidget):
         self.issue_index = -1
         self.issue_count.setText(f'Issues: {len(self.issue_events)}')
         self.issue_explanation.setPlainText('Use Issue ▶ / ◀ Issue to inspect recorded warnings and errors.')
+        self.export_status.setText('')
         self.camera_image.clear_frame('Move the timeline to load the matching recorded camera frame.')
         self._render()
 
@@ -447,6 +488,24 @@ class TrackingReplay(QtWidgets.QWidget):
 
     def clear_timeline_frame(self, text):
         self.camera_image.clear_frame(text)
+
+    def _export_csv(self):
+        if not self.samples:
+            self.export_status.setText('No tracking samples available.')
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 'Export tracking CSV', 'tracking-replay.csv', 'CSV files (*.csv)')
+        if not path:
+            return
+        try:
+            with open(path, 'w', newline='', encoding='utf-8') as output:
+                writer = csv.DictWriter(output, fieldnames=TRACKING_CSV_COLUMNS)
+                writer.writeheader()
+                writer.writerows(tracking_csv_rows(self.samples))
+        except OSError as error:
+            self.export_status.setText('Tracking CSV export failed: ' + str(error))
+            return
+        self.export_status.setText(f'Exported tracking CSV: {path}')
 
     def _toggle_camera_frame(self, enabled):
         self.camera_stack.setCurrentIndex(0 if enabled else 1)
@@ -743,6 +802,7 @@ class TtcInvestigation(QtWidgets.QWidget):
         self.recalculate_button = QtWidgets.QPushButton('Recalculate from episode start')
         self.recalculate_button.clicked.connect(self.recalculate)
         self.export_button = QtWidgets.QPushButton('Export TTC CSV')
+        mark_export_button(self.export_button)
         self.export_button.clicked.connect(self._export_csv)
         self.more_button = QtWidgets.QToolButton()
         self.more_button.setText('…')
@@ -1041,6 +1101,9 @@ class Overview(QtWidgets.QMainWindow):
             QMainWindow, QWidget { background:#142233; color:#d9e6f4; font:13px sans-serif; }
             QPushButton { background:#284c68; padding:8px 15px; border:1px solid #426983; border-radius:5px; }
             QPushButton:hover { background:#356381; } QPushButton:disabled { color:#6f8298; }
+            QPushButton[buttonRole="export"] { background:#237a67; border:1px solid #70d6ad; color:#f1fff9; font-weight:600; }
+            QPushButton[buttonRole="export"]:hover { background:#2d967e; }
+            QPushButton[buttonRole="export"]:disabled { background:#284c68; border-color:#426983; color:#6f8298; }
             QComboBox { padding:7px; background:#1e344a; border:1px solid #3b5269; border-radius:4px; }
             QTabWidget::pane { border:1px solid #30485f; } QTabBar::tab { padding:9px 20px; background:#203950; }
             QTabBar::tab:selected { border-bottom:2px solid #58b8f5; }
@@ -1068,6 +1131,7 @@ class Overview(QtWidgets.QMainWindow):
         self.open_button.clicked.connect(self.choose_file)
         top.addWidget(self.open_button)
         self.export_button = QtWidgets.QPushButton('Export MP4…')
+        mark_export_button(self.export_button)
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self.choose_export)
         top.addWidget(self.export_button)

@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 from PySide6 import QtWidgets
 
-from flight_lens.app import ErdDialog, ExportDialog, Overview, TrackingReplay, load_config, sql_chart
+from flight_lens.app import (ErdDialog, ExportDialog, Overview, TrackingReplay, load_config,
+                              sql_chart, tracking_csv_rows)
 from flight_lens.model import TrackingSample
 from flight_lens.reader import load_flight, Cancelled
 
@@ -71,6 +72,36 @@ def test_tracking_replay_sub_one_speed_and_categorized_readout(application):
     replay.close()
 
 
+def test_tracking_csv_rows_preserve_bbox_and_missing_measurements():
+    samples = (
+        TrackingSample(
+            time_s=1.25, phase='LOS_APPROACH', reason='tracking', navigator_state='LOS',
+            bbox=(10., 20., 30., 40.), bbox_age_s=.02, dx_px=-3., dy_px=4.,
+            ttc_raw_s=None, ttc_filtered_s=None, ttc_valid=None, ttc_reason=None,
+            measured_attitude_deg=None, measured_attitude_age_s=None,
+            requested_roll_deg=None, requested_pitch_deg=None,
+            requested_yaw_rate_deg_s=None, requested_thrust_n=None,
+        ),
+        TrackingSample(
+            time_s=1.5, phase='LOS_RECOVER', reason='no_target', navigator_state='RECOVER',
+            bbox=None, bbox_age_s=None, dx_px=None, dy_px=None,
+            ttc_raw_s=None, ttc_filtered_s=None, ttc_valid=False, ttc_reason='no_bbox',
+            measured_attitude_deg=None, measured_attitude_age_s=None,
+            requested_roll_deg=None, requested_pitch_deg=None,
+            requested_yaw_rate_deg_s=None, requested_thrust_n=None,
+        ),
+    )
+
+    rows = tracking_csv_rows(samples)
+
+    assert rows[0]['bbox_x'] == 10.
+    assert rows[0]['bbox_height'] == 40.
+    assert rows[0]['dx_px'] == -3.
+    assert rows[0]['dy_px'] == 4.
+    assert rows[1]['bbox_x'] is None
+    assert rows[1]['dx_px'] is None
+
+
 @pytest.fixture
 def window(application):
     view=Overview()
@@ -93,6 +124,9 @@ def test_overview_async_loading_cursor_event_and_frame(window,application,flight
     assert window.tabs.tabText(6)=='Tracking'
     assert window.tabs.tabText(7)=='Assistant'
     assert window.tracking_tab.show_camera_frame.isChecked()
+    assert window.export_button.property('buttonRole') == 'export'
+    assert window.ttc_tab.export_button.property('buttonRole') == 'export'
+    assert window.tracking_tab.export_button.property('buttonRole') == 'export'
     window.tracking_tab.show_camera_frame.setChecked(False)
     assert window.tracking_tab.camera_stack.currentIndex() == 1
     window.tracking_tab.show_camera_frame.setChecked(True)
