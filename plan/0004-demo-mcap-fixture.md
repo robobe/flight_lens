@@ -28,8 +28,8 @@ Provide a tiny, reproducible MCAP recording for FlightLens development and manua
 
 ## Status
 
-Pending.
+Implemented and verified.
 
 ## Implementation commit
 
-Pending.
+`8dc605d`
