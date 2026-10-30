@@ -28,8 +28,8 @@ Export the selected episode's tracking timeline, including bounding-box geometry
 
 ## Status
 
-Pending.
+Implemented and verified.
 
 ## Implementation commit
 
-Pending.
+`1deacd0`
