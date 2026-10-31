@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from flight_lens.ttc_analysis import (TtcParameters, TtcPoint, butterworth_filter,
-                                      compare_to_hit_time, low_pass_filter, recalculate)
+                                      causal_low_pass_filter, compare_to_hit_time,
+                                      low_pass_filter, recalculate)
 
 
 def samples(sizes, *, start=0.0, dt=.04, reason='qualified'):
@@ -65,6 +66,27 @@ def test_low_pass_filter_resets_across_invalid_samples():
 def test_low_pass_filter_rejects_invalid_alpha():
     with pytest.raises(ValueError):
         low_pass_filter((), alpha=0.)
+
+
+def test_causal_low_pass_uses_elapsed_time_and_resets():
+    points = (TtcPoint(0., 1., True, 'qualified'),
+              TtcPoint(.1, 3., True, 'qualified'),
+              TtcPoint(.5, 5., True, 'qualified'),
+              TtcPoint(.6, None, False, 'recovery'),
+              TtcPoint(.7, 7., True, 'qualified'))
+    filtered = causal_low_pass_filter(points, time_constant_s=.1)
+    assert filtered[0] == 1.
+    assert filtered[1] == pytest.approx(1. + (1. - 2.718281828459045 ** -1) * 2.)
+    expected = (1. + (1. - 2.718281828459045 ** -1) * 2.)
+    expected += (1. - 2.718281828459045 ** -4) * (5. - expected)
+    assert filtered[2] == pytest.approx(expected)
+    assert filtered[3] is None
+    assert filtered[4] == 7.
+
+
+def test_causal_low_pass_rejects_invalid_time_constant():
+    with pytest.raises(ValueError):
+        causal_low_pass_filter((), time_constant_s=0.)
 
 
 def test_hit_time_comparison_reports_oracle_metrics():

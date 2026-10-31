@@ -1,7 +1,7 @@
 """Production-faithful optical TTC replay for FlightLens investigation."""
 from collections import Counter, deque
 from dataclasses import dataclass
-from math import isfinite, pi, sqrt, tan
+from math import exp, isfinite, pi, sqrt, tan
 
 
 EPSILON = 1e-12
@@ -145,6 +145,29 @@ def low_pass_filter(points, alpha=.25):
             previous = None
             continue
         previous = point.value_s if previous is None else previous + alpha * (point.value_s - previous)
+        filtered[index] = previous
+    return tuple(filtered)
+
+
+def causal_low_pass_filter(points, time_constant_s=.15):
+    """Apply a time-aware causal EMA without bridging invalid samples."""
+    if not isfinite(time_constant_s) or time_constant_s <= 0:
+        raise ValueError('low-pass time constant must be positive')
+    filtered = [None] * len(points)
+    previous = None
+    previous_time = None
+    for index, point in enumerate(points):
+        value = point.value_s
+        if not point.valid or value is None or not isfinite(value):
+            previous = None
+            previous_time = None
+            continue
+        if previous is None or previous_time is None or point.time_s <= previous_time:
+            previous = value
+        else:
+            alpha = 1. - exp(-(point.time_s - previous_time) / time_constant_s)
+            previous += alpha * (value - previous)
+        previous_time = point.time_s
         filtered[index] = previous
     return tuple(filtered)
 
